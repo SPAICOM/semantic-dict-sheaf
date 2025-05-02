@@ -17,9 +17,9 @@ Activate the environment:
 
 - On macOS/Linux:
 
-  ```bash
-    source <venv_name>/bin/activate
-      ```
+```bash
+source <venv_name>/bin/activate
+```
 
 - On Windows:
 
@@ -33,7 +33,7 @@ Once the virtual environment is active, install the dependencies:
 pip install -r requirements.txt
 ```
 
-You're ready to go!
+You're ready to go!  
 
 ### Using `uv` package manager (Highly Recommended)
 
@@ -53,7 +53,7 @@ uv sync
 
 This will automatically create a virtual environment (if none exists) and install all dependencies.
 
-You're ready to go!
+You're ready to go!  
 
 ## Authors
 
