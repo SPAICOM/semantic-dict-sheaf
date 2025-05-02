@@ -1,3 +1,10 @@
+# Other
+data/
+*.ckpt
+outputs/
+wandb/
+multirun/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

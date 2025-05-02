@@ -21,7 +21,7 @@ from pytorch_lightning.callbacks import (
 )
 
 from src.datamodules import DataModuleClassifier
-from src.neural_models import Classifier
+from src.neural import Classifier
 
 
 # =============================================================
