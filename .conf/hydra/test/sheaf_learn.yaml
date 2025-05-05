@@ -1,0 +1,15 @@
+seed: 1218
+device: cpu
+
+network:
+  n_agents: 10
+  models: [vit_base_patch16_224]
+  node_dims: [192]
+  p_edges: 1.0
+
+algorithm:
+  n_iter: 10
+  alpha: 0.1
+  lambda_: 0.1
+  tau_a: 0.001
+  tau_r: 0.001

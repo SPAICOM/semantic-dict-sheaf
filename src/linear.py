@@ -4,6 +4,7 @@ import torch
 from typing import Any
 from igraph import Graph
 from tqdm.auto import tqdm
+import jax.numpy as jnp
 
 
 class Agent:
@@ -25,12 +26,31 @@ class Agent:
         self.restriction_maps: dict[int, torch.Tensor] = {}
 
     def map_initialization(
-        self, neighbour_id: int, edge_stalk_dim: int
+        self,
+        neighbour_id: int,
+        edge_stalk_dim: int,
     ) -> None:
         """ """
-        self.restriction_maps[neighbour_id] = torch.zeros(
-            edge_stalk_dim, self.stalk_dim
+        self.restriction_maps[neighbour_id] = torch.randn(
+            (edge_stalk_dim, self.stalk_dim)
         ).to(self.device)
+        return None
+
+    def map_update(
+        self,
+        neighbour_id: int,
+        map_value: torch.Tensor,
+    ) -> None:
+        """ """
+        self.restriction_maps[neighbour_id] = map_value
+        return None
+
+    def latent_initialization(
+        self,
+        n: int,
+    ) -> None:
+        """ """
+        self.X = torch.randn((self.stalk_dim, n), device=self.device)
         return None
 
 
@@ -77,6 +97,7 @@ class Network:
     def edges_capacity(
         self,
         edges_stalks: dict[tuple[int, int], int] = None,
+        test: bool = False,
     ) -> None:
         """ """
         for i, j in tqdm(self.graph.get_edgelist()):
@@ -98,6 +119,58 @@ class Network:
                 neighbour_id=i, edge_stalk_dim=e_stalk
             )
 
+        return None
+
+    def update_restriction_maps(
+        self,
+        edge: tuple[int, int],
+        F_ij: torch.Tensor,
+        F_ji: torch.Tensor,
+    ) -> None:
+        """ """
+        i, j = edge
+        self.agents[i].map_update(j, F_ij)
+        self.agents[j].map_update(i, F_ji)
+
+        return None
+
+    def get_sample_covs(
+        self,
+        edge: tuple[int, int],
+        out: str = 'torch',
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """ """
+        assert out in [
+            'torch',
+            'numpy',
+            'jax',
+        ], (
+            "Output type must be either 'torch' (torch.Tensor), 'numpy' (np.ndarray), or 'jax' (jax.array)."
+        )
+
+        i, j = edge
+        S_i = self.agents[i].X @ self.agents[i].X.T
+        S_j = self.agents[j].X @ self.agents[j].X.T
+        S_ij = self.agents[i].X @ self.agents[j].X.T
+        S_ji = self.agents[j].X @ self.agents[i].X.T
+
+        if out == 'np':
+            S_i = S_i.detach().cpu().numpy()
+            S_j = S_j.detach().cpu().numpy()
+            S_ij = S_ij.detach().cpu().numpy()
+            S_ji = S_ji.detach().cpu().numpy()
+        elif out == 'jax':
+            S_i = jnp.array(S_i.detach().cpu().numpy())
+            S_j = jnp.array(S_j.detach().cpu().numpy())
+            S_ij = jnp.array(S_ij.detach().cpu().numpy())
+            S_ji = jnp.array(S_ji.detach().cpu().numpy())
+
+        return S_i, S_j, S_ij, S_ji
+
+    def data_initialization(self, n: int = 10) -> None:
+        """ """
+        for i in range(self.n_agents):
+            self.agents[i].latent_initialization(n)
         return None
 
 
