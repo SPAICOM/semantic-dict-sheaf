@@ -1,25 +1,30 @@
 """In this python module we define class that handles the dataset:
 - CustomDataset: a custom Pytorch Dataset for encoding from an absolute representation to a relative one.
-- DatasetClassifier: a custom Pytorch Dataset for classifing images.
+- DatasetClassifier: a custom Pytorch Dataset for classifying images.
 - DataModule: a Pytorch Lightning Data Module for the Relative Encoder.
-- DataModuleClassifier: a Pytorch Lightning Data Module for classifing the images.
+- DataModuleClassifier: a Pytorch Lightning Data Module for classifying the images.
 """
 
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(sys.path[0]).parent))
+
+from src.download_utils import download_zip_from_gdrive
 import torch
 from pathlib import Path
 from sklearn.cluster import KMeans
 from torch.utils.data import Dataset, DataLoader
 from pytorch_lightning import LightningDataModule
 
-
-if __name__ == '__main__':
-    from download_utils import (
-        download_zip_from_gdrive,
-    )
-else:
-    from src.download_utils import (
-        download_zip_from_gdrive,
-    )
+# if __name__ == "__main__":
+#     from download_utils import (
+#         download_zip_from_gdrive,
+#     )
+# else:
+# from src.download_utils import (
+#     download_zip_from_gdrive,
+# )
 
 # =====================================================
 #
@@ -256,10 +261,16 @@ class DataModule(LightningDataModule):
         self.num_workers: int = num_workers
         self.seed: int = seed
 
-        assert self.method in ['random', 'centroid'], (
+        assert self.method in [
+            'random',
+            'centroid',
+        ], (
             'The passed method is not supported, chose between "random" or "centroid".'
         )
-        assert self.grouping in ['label', 'proto'], (
+        assert self.grouping in [
+            'label',
+            'proto',
+        ], (
             'The passed grouping method is not supported, chose between "label" or "cluster".'
         )
 

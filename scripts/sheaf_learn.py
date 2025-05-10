@@ -8,8 +8,10 @@ from pathlib import Path
 sys.path.append(str(Path(sys.path[0]).parent))
 
 from src.linear import Network
+from utils import memoize
 from typing import Any
 from tqdm.auto import tqdm
+import torch
 from scipy.linalg import solve_sylvester, polar
 import numpy as np
 import hydra
@@ -22,13 +24,12 @@ def generate_data(cfg):
     for i in range(cfg.network.n_agents):
         agents_info[i] = {
             'model': cfg.network.models[k],
-            'stalk_dim': cfg.network.node_dims[k],
+            'dataset': cfg.network.datasets[k],
         }
 
     # Note: assumes Network has been updated to work with NumPy arrays
     net = Network(agents_info=agents_info)
     net.graph_initialization(p=cfg.network.p_edges)
-    net.edges_capacity()
     net.data_initialization()
     return net
 
@@ -46,6 +47,7 @@ def block_st(
     return X * scales
 
 
+@memoize
 def sheaf_learn(
     cfg,
     net: Network,
@@ -56,6 +58,8 @@ def sheaf_learn(
     lambda_ = cfg.algorithm.lambda_
     tau_a = cfg.algorithm.tau_a
     tau_r = cfg.algorithm.tau_r
+    n_edges = cfg.algorithm.n_edges
+    verbose = cfg.algorithm.verbose
 
     for i, j in tqdm(net.graph.get_edgelist()):
         F_ij = net.agents[i].restriction_maps[j].detach().cpu().numpy()
@@ -64,7 +68,7 @@ def sheaf_learn(
         n_j = F_ji.shape[1]
         n_ij = F_ij.shape[0]
 
-        S_i, S_j, S_ij, S_ji = net.get_sample_covs((i, j), to_np=True)
+        S_i, S_j, S_ij, S_ji = net.get_sample_covs((i, j), out='np')
 
         Y_i = np.random.randn(n_i, n_ij)
         Y_j = np.random.randn(n_j, n_ij)
@@ -73,7 +77,7 @@ def sheaf_learn(
         V_ij = np.random.randn(n_i + n_j, n_ij)
         U_ij = np.random.randn(n_i + n_j, n_ij)
 
-        for _ in range(n_iter):
+        for k in range(n_iter):
             # Update F_ji via Sylvester
             A_j = np.eye(n_ij) - F_ij @ F_ij.T
             B_j = F_ij @ S_i @ F_ij.T + alpha * np.eye(n_ij)
@@ -173,27 +177,55 @@ def sheaf_learn(
                 < tau_a * np.sqrt(n_ij * (n_i + n_j))
                 + tau_r * alpha * np.linalg.norm(U_ij, ord='fro')
             )
-            if all(conditions):
-                break
 
-        # Write back the learned maps
-        net.update_restriction_maps((i, j), F_ij, F_ji)
+            if verbose:
+                if all(conditions):
+                    print(
+                        f'Early Stopping \n Convergence reached for edge ({i}, {j}) after {k} iterations.'
+                    )
+                    break
 
-    return None
+                if k == n_iter - 1:
+                    print(f'Max iterations reached for edge ({i}, {j}).')
+
+        net.update_restriction_maps(
+            (i, j),
+            torch.from_numpy(F_ij.astype(np.float32)),
+            torch.from_numpy(F_ji.astype(np.float32)),
+        )
+
+    net.update_graph(n_edges=n_edges, lambda_=lambda_)
+
+    return net
 
 
 @hydra.main(
-    config_path='../.conf/hydra/test',
+    config_path='../.conf/hydra/network',
     config_name='sheaf_learn',
     version_base='1.3',
 )
 def main(cfg) -> None:
     """The main script loop."""
+
     print('Starting the data generation...')
     net = generate_data(cfg)
     print('Data generation completed.')
+
     print('Starting the sheaf learning...')
-    sheaf_learn(cfg, net)
+    net = sheaf_learn(cfg, net)
+
+    # for i, j in tqdm(net.graph.get_edgelist()):
+    #     F_ij = net.agents[i].restriction_maps[j].to(torch.float32)
+    #     F_ji = net.agents[j].restriction_maps[i].to(torch.float32)
+    #     net.update_restriction_maps((i, j), F_ij, F_ji)
+
+    print('Sheaf learning completed.')
+
+    print('Starting the evaluation...')
+    net.eval(
+        dataset=cfg.evaluation.dataset,
+        seed=cfg.seed,
+    )
 
     return None
 
