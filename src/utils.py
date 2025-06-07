@@ -18,13 +18,24 @@
     Perform in an efficient way the A^{-1}B.
 - prewhiten:
     Prewhiten the training and test data using only training data statistics.
+- random_stiefel:
+    Returns a matrix Q whose columns are orthonormal sampled uniformly from the Stiefel manifold.
+- block_st:
+    Apply block soft thresholding operator to each column of a matrix.
+- projected_proximal:
+    Apply the projected proximal operator to a matrix.
 """
 
 import math
 import torch
 import shutil
+import numpy as np
+from typing import Any
+import jax.numpy as jnp
 from pathlib import Path
-
+from functools import wraps
+from numpy.linalg import svd
+from pytorch_lightning import seed_everything
 
 # ================================================================
 #
@@ -342,6 +353,131 @@ def remove_non_empty_dir(path: str) -> None:
         raise Exception(f'Error while removing directory: {e}')
 
     return None
+
+
+def random_stiefel(
+    n: int,
+    p: int,
+    seed: int = 42,
+) -> torch.Tensor:
+    """
+    Returns an n x p matrix Q whose columns are orthonormal,
+    sampled uniformly from the Stiefel manifold V_{n,p}.
+
+    Parameters:
+        n : int
+            Number of rows (ambient dimension).
+        p : int
+            Number of orthonormal columns (p <= n).
+
+    Returns
+        Q : torch.Tensor, shape (n, p)
+            A semi‐orthogonal matrix with Q.T @ Q == I_p.
+    """
+    seed_everything(seed)
+    A = np.random.randn(n, p)
+    U, _, Vt = svd(A, full_matrices=False)
+    res = U @ Vt
+    return torch.from_numpy(res.astype(np.float32))
+
+
+def block_st(
+    X: np.ndarray,
+    beta: float = 0.1,
+) -> np.ndarray:
+    """
+    Apply block soft thresholding operator to each column of a matrix.
+    NumPy equivalent of the original Torch version.
+    """
+    norms = np.linalg.norm(X, axis=0)
+    scales = np.maximum(1 - beta / norms, 0.0)
+    return X * scales
+
+
+def projected_proximal(
+    X: np.ndarray,
+    lambda_: float = 0.1,
+) -> np.ndarray:
+    """
+    Apply the projected proximal operator to a matrix.
+    """
+    assert lambda_ > 0 and lambda_ < 0.5, 'lambda_ must be in [0, 1/2]'
+    d = np.diag(X)
+    d = np.clip((d > np.sqrt(2 * lambda_)) * d, 0, 1)
+    return np.diag(d)
+
+
+def convert_output(fn):
+    @wraps(fn)
+    def wrapper(self, *args, out: str = 'torch', **kwargs):
+        result = fn(self, *args, **kwargs)
+
+        def _convert(x: Any) -> Any:
+            if x is None:
+                return x
+
+            if isinstance(x, np.ndarray):
+                if out == 'torch':
+                    x = torch.from_numpy(x.astype(np.float32))
+                elif out == 'jax':
+                    x = jnp.array(x)
+                elif out == 'numpy':
+                    x = x
+                else:
+                    raise ValueError(
+                        f"Unsupported out='{out}' for NumPy input"
+                    )
+
+            elif isinstance(x, torch.Tensor):
+                if out == 'numpy':
+                    x = x.detach().cpu().numpy()
+                elif out == 'jax':
+                    x = jnp.array(x.detach().cpu().numpy())
+                elif out == 'torch':
+                    x = x
+                else:
+                    raise ValueError(
+                        f"Unsupported out='{out}' for torch.Tensor input"
+                    )
+
+            elif isinstance(x, jnp.ndarray):
+                if out == 'numpy':
+                    x = np.array(x)
+                elif out == 'torch':
+                    x = torch.from_numpy(np.array(x).astype(np.float32))
+                elif out == 'jax':
+                    x = x
+                else:
+                    raise ValueError(f"Unsupported out='{out}' for JAX input")
+
+            else:
+                raise TypeError(f"Cannot convert type {type(x)} to '{out}'")
+
+            return x
+
+        if isinstance(result, tuple):
+            return tuple(_convert(elem) for elem in result)
+        else:
+            return _convert(result)
+
+    return wrapper
+
+
+def convert_input(
+    x,
+    device: str,
+) -> torch.Tensor:
+    if x is None:
+        return x
+    if isinstance(x, torch.Tensor):
+        x = x.to(device)
+    elif isinstance(x, np.ndarray):
+        x = torch.from_numpy(x).to(device)
+    elif isinstance(x, jnp.ndarray):
+        x = torch.from_numpy(np.array(x)).to(device)
+    else:
+        raise TypeError(f'Cannot convert type {type(x)} to torch.Tensor')
+    return x
 
 
 # ================================================================

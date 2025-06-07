@@ -1,25 +1,25 @@
 seed: 42
-device: cpu
+device: cuda
 
 network:
-  n_agents: 10
   models:
-    [
-      vit_base_patch16_224,
-      vit_base_patch32_clip,
-      vit_small_patch16_224,
-      vit_small_patch32_224,
-      vit_tiny_patch16_224,
-    ]
-  datasets: [cifar10, cifar10, cifar10, cifar10, cifar10]
-  node_dims: [192]
+    {
+      "vit_base_patch16_224": ["cifar10", 42],
+      "vit_base_patch32_clip": ["cifar10", 42],
+      "vit_small_patch16_224": ["cifar10", 42],
+      "vit_small_patch32_224": ["cifar10", 42],
+      "vit_tiny_patch16_224": ["cifar10", 42],
+    }
+  mask_restrictions: True
   p_edges: 0.4
-  path: /results/learned_sheaf/
+  path: learned_sheaf
 
 algorithm:
   n_iter: 40
   alpha: 0.1
   lambda_: 0.1
+  beta: 0.1
+  mu: 0.1
   tau_a: 0.0001
   tau_r: 0.0001
   verbose: true
