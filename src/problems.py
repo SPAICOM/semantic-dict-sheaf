@@ -26,7 +26,11 @@ class EdgeProblem:
         # ================================================================
         self.edge = edge
         self.F_i, self.F_j = self.edge.get_restriction_maps()
-        self.X_i, self.X_j = self.edge.get_latents(out='numpy')
+        self.X_i, self.X_j, _, _ = self.edge.get_latents(
+            prewhite=False,
+            scale=True,
+            out='numpy',
+        )
         self.S_i, self.S_j = self.edge.get_sparse_representations(out='numpy')
         self.cov_i, self.cov_j, self.cov_ij, self.cov_ji = (
             self.edge.get_latent_covariances(out='numpy')
@@ -53,18 +57,26 @@ class EdgeProblem:
         self.alpha = defaults['lagrange_multiplier']
         self.lambda_ = defaults['mask_regularizer']
         self.beta = defaults['align_comm_tradeoff']
+        self.ev = defaults['explained_variance']
         self.mu = defaults['proximal_stepsize']
         self.n_iters = defaults['n_iters']
         self.run = run
 
     # ================================================================
-    #                      Evaluation Metrics
+    #                   Possible Evaluation Metrics
     # ================================================================
 
-    def _semantic_misalignment(self):
-        return norm(
-            self.F_j @ self.D_j @ self.S_j - self.D_i @ self.S_i, ord='fro'
-        )
+    def _semantic_misalignment(
+        self,
+        sub_projection: bool = True,
+    ):
+        if sub_projection:
+            sm = norm(
+                self.F_j @ self.D_j @ self.S_j - self.D_i @ self.S_i, ord='fro'
+            )
+        else:
+            sm = norm(self.F_j @ self.X_j - self.X_i, ord='fro')
+        return sm
 
     def _sparse_reconstructions(self):
         return norm(self.X_j - self.D_j @ self.S_j, ord='fro') + norm(
@@ -77,20 +89,50 @@ class EdgeProblem:
             + self.gamma2 * norm(self.S_j, ord=2, axis=1).sum()
         )
 
-    def eval(self) -> float:
-        mis = self._semantic_misalignment()
-        rec = self._sparse_reconstructions()
-        reg = self._sparse_regularizers()
-        self.loss = mis + rec + reg
-        if self.run is not None:
-            self.run.log({f'Training Loss for edge {self.edge.id}': self.loss})
-        return self.loss
+    # ================================================================
+    #                          Edge Update
+    # ================================================================
 
     def update_edge(self):
         self.edge.update_restriction_maps(self.F_i, self.F_j)
         self.edge.update_sparse_representations(self.S_i, self.S_j)
         self.edge.update_mask(self.Z_ij)
         self.edge.update_loss(self.loss)
+
+    # ================================================================
+    #                      Alignment Evaluation
+    # ================================================================
+
+    def eval(self) -> float:
+        self.loss = self._semantic_misalignment()
+        if self.run is not None:
+            self.run.log({f'Loss (edge {self.edge.id})': self.loss})
+        return self.loss
+
+    # ================================================================
+    #                 Fitting the Alignment Process
+    # ================================================================
+    def fit(self):
+        """Update restriction maps solving orthogonal Procrustes problem"""
+        U, _, Vt = svd(self.cov_j @ self.cov_i.T)
+        self.F_j = U @ Vt
+        # print(f'Edge {self.edge.id} map: \n {self.F_j}')
+        self.eval()
+        self.update_edge()
+        return None
+
+    # def eval(self) -> float:
+    #     mis = self._semantic_misalignment()
+    #     rec = self._sparse_reconstructions()
+    #     reg = self._sparse_regularizers()
+    #     self.loss = mis + rec + reg
+    #     if self.run is not None:
+    #         self.run.log(
+    #             {
+    #                 f'Training Loss edge {self.edge.id} - ev {self.ev}': self.loss
+    #             }
+    #         )
+    #     return self.loss
 
     # def fit(
     #     self,
@@ -138,14 +180,16 @@ class EdgeProblemProcrustes(EdgeProblem):
     def eval(self) -> float:
         self.loss = self._semantic_misalignment()
         if self.run is not None:
-            self.run.log({f'Training Loss for edge {self.edge.id}': self.loss})
+            self.run.log({f'Loss (edge {self.edge.id})': self.loss})
         return self.loss
 
     def fit(self):
-        """Update restriction maps solving orthogonal Procrustes problem"""
-        U, _, V = svd(self.D_j @ self.S_j @ self.S_i.T @ self.D_i.T)
-        self.F_j = U @ V.T
-
+        """Update restriction maps solving orthogonal Procrustes problem
+        on a common subspace.
+        """
+        U, _, Vt = svd(self.D_j @ self.S_j @ self.S_i.T @ self.D_i.T)
+        self.F_j = U @ Vt
+        # print(f'Edge {self.edge.id} map: \n {self.F_j}')
         self.eval()
         self.update_edge()
         return None

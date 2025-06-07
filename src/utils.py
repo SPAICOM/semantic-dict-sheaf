@@ -451,7 +451,9 @@ def convert_output(fn):
                     raise ValueError(f"Unsupported out='{out}' for JAX input")
 
             else:
-                raise TypeError(f"Cannot convert type {type(x)} to '{out}'")
+                raise TypeError(
+                    f"Cannot convert type {type(x)} of {x} to '{out}'"
+                )
 
             return x
 
@@ -476,7 +478,9 @@ def convert_input(
     elif isinstance(x, jnp.ndarray):
         x = torch.from_numpy(np.array(x)).to(device)
     else:
-        raise TypeError(f'Cannot convert type {type(x)} to torch.Tensor')
+        raise TypeError(
+            f'Cannot convert type {type(x)} of {x} to torch.Tensor'
+        )
     return x
 
 

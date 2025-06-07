@@ -100,7 +100,7 @@ class Agent:
         coder_params: dict[Any] = {},
     ) -> None:
         """ """
-        X, _ = self.get_latent(prewhite=True, out='numpy')
+        X, _ = self.get_latent(prewhite=True, scale=True, out='numpy')
         coder = SparseCoder(
             X=X,
             params=coder_params,
@@ -161,6 +161,7 @@ class Agent:
     def get_latent(
         self,
         prewhite: bool = False,
+        scale: bool = False,
         test: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if test:
@@ -176,6 +177,11 @@ class Agent:
                 else (self.X_train, None, None)
             )
             X_te = None
+        if scale:
+            X_tr /= torch.norm(X_tr, p='fro')
+            X_te = (
+                X_te / torch.norm(X_te, p='fro') if X_te is not None else X_te
+            )
         return X_tr, X_te
 
 
@@ -227,18 +233,21 @@ class Edge:
     @convert_output
     def get_latents(
         self,
-        set: str = 'train',
+        prewhite: bool = False,
+        scale: bool = False,
+        test: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert set in ('train', 'test'), (
-            '"set" argument must be either "train" or "test".'
+        X_i, X_i_test = self.head.get_latent(
+            prewhite=prewhite,
+            scale=scale,
+            test=test,
         )
-        if set == 'train':
-            X_i = self.head.X_train
-            X_j = self.head.X_train
-        else:
-            X_i = self.head.X_test
-            X_j = self.head.X_test
-        return X_i, X_j
+        X_j, X_j_test = self.head.get_latent(
+            prewhite=prewhite,
+            scale=scale,
+            test=test,
+        )
+        return X_i, X_j, X_i_test, X_j_test
 
     @convert_output
     def get_latent_covariances(
@@ -413,7 +422,7 @@ class Network:
             'n_edges must be a positive integer, smaller than the current number of edges in the graph.'
         )
 
-        edge_losses = {edge: edge.loss for edge in self.edges}
+        edge_losses = {edge.id: edge.loss for edge in self.edges.values()}
         to_remove = list(
             dict(sorted(edge_losses.items(), key=lambda item: item[1])).keys()
         )[n_edges:]

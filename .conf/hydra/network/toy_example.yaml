@@ -13,7 +13,13 @@ network:
     - vit_small_patch32_224:
       - cifar10
       - 42
+    - vit_small_patch16_224:
+      - cifar10
+      - 42
     - vit_small_patch32_384:
+      - cifar10
+      - 42
+    - vit_small_patch32_224:
       - cifar10
       - 42
 
@@ -23,17 +29,19 @@ algorithm:
   proximal_stepsize: 1e-4
   sparse_regularizer_head: 1e-3
   sparse_regularizer_tail: 1e-3
+  explained_variance: null
   verbose: true
   n_edges: 2
   learn_dict: False
 
 coder:
-  sparsity_level: 0.3
-  regularizer: 1e-3
-  n_atoms: None
-  dictionary_type: fourier
-  max_iter: 100
-  tol: 1e-4
+  explained_variance: null
+  sparsity_level: null
+  regularizer: null
+  n_atoms: null
+  dictionary_type: null
+  max_iter: null
+  tol: null
 
 wandb:
   project: toy_example
