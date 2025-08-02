@@ -26,6 +26,7 @@
     Apply the projected proximal operator to a matrix.
 """
 
+import os
 import math
 import torch
 import shutil
@@ -34,7 +35,9 @@ from typing import Any
 import jax.numpy as jnp
 from pathlib import Path
 from functools import wraps
-from numpy.linalg import svd
+from numpy.linalg import svd, norm
+import matplotlib.pyplot as plt
+from sklearn.manifold import MDS
 from pytorch_lightning import seed_everything
 
 # ================================================================
@@ -381,17 +384,66 @@ def random_stiefel(
     return torch.from_numpy(res.astype(np.float32))
 
 
-def block_st(
+def n_atoms(S: torch.Tensor, threshold: float = 1e-5) -> int:
+    """
+    Returns the number of atoms selected by the sparse representation rows,
+    i.e., the number of rows in the matrix that have a non-zero norm.
+
+    Parameters:
+        S (torch.Tensor): A 2D tensor.
+
+    Returns:
+        int: The number of rows with non-zero norm.
+    """
+    row_norms = torch.norm(S, p=2, dim=1)
+    print(f'Sparsity: {int(torch.sum(row_norms > threshold).item())}')
+    return int(torch.sum(row_norms > threshold).item())
+
+
+def block_thresholding(
     X: np.ndarray,
     beta: float = 0.1,
+    hard: bool = False,
+    columnwise: bool = False,
 ) -> np.ndarray:
     """
-    Apply block soft thresholding operator to each column of a matrix.
-    NumPy equivalent of the original Torch version.
+    Block soft-thresholding operator.
+
+        BST_β(x) = max(1 − β / ‖x‖₂, 0) · x
+
+    For columnwise=True the operator is applied to each column;
+    otherwise it is applied to each row.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Input matrix (m × n).
+    beta : float
+        Threshold parameter β ≥ 0.
+    columnwise : bool
+        If True, act on columns; if False (default), act on rows.
+
+    Returns
+    -------
+    np.ndarray
+        Matrix after block soft-thresholding.
     """
-    norms = np.linalg.norm(X, axis=0)
-    scales = np.maximum(1 - beta / norms, 0.0)
+    axis = 0 if columnwise else 1
+    norms = norm(X, ord=2, axis=axis, keepdims=True)
+    if hard:
+        scales = np.zeros_like(norms)
+        scales[norms >= np.sqrt(2 * beta)] = 1.0
+    else:
+        scales = np.maximum(
+            1.0 - beta / np.where(norms == 0, beta, norms), 0.0
+        )
+    # print(f'Scales: {X * scales}')
     return X * scales
+
+
+def colnorm(X: np.ndarray) -> np.ndarray:
+    dd = norm(X, axis=0)
+    return X @ np.diag(1.0 / dd)
 
 
 def projected_proximal(
@@ -405,6 +457,62 @@ def projected_proximal(
     d = np.diag(X)
     d = np.clip((d > np.sqrt(2 * lambda_)) * d, 0, 1)
     return np.diag(d)
+
+
+def layout_embedding(
+    graph: np.ndarray,
+    layout: np.ndarray = None,
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    Perform layout embedding using MDS (Multidimensional Scaling) on a distance matrix.
+
+    Args:
+        graph : ig.Graph
+            The input graph with edge weights representing distances.
+        seed : int
+            Random seed for reproducibility.
+
+    Returns:
+        np.ndarray
+            The embedded coordinates for clustering and graph layout.
+    """
+
+    # Features for clustering
+    D = np.array(graph.shortest_paths_dijkstra(weights='weight'))
+    # Remove NaN values and ensure finite distances
+    finite_mask = np.isfinite(D)
+    if not np.all(finite_mask):
+        max_finite = np.max(D[finite_mask])
+        D[~finite_mask] = max_finite * 1.1
+    # Ensure symmetry
+    D = 0.5 * (D + D.T)
+    # Scale distances
+    # sm = MinMaxScaler()
+    # D = sm.fit_transform(D)
+    # Apply Multidimensional Scaling (MDS)
+    embedding = MDS(
+        n_components=2, dissimilarity='precomputed', random_state=seed
+    )
+    features = embedding.fit_transform(D).tolist()
+
+    # Embedding for layout
+    if layout is None:
+        distances = np.array(graph.es['weight'])
+        epsilon = 1e-2
+        inv_weights = np.clip(
+            1.0
+            / np.clip(
+                distances + (np.random.randn(*distances.shape) / 10),
+                epsilon,
+                None,
+            ),
+            0,
+            3,
+        )
+        graph.es['inv_weight'] = inv_weights
+        layout = graph.layout_fruchterman_reingold(weights=inv_weights)
+    return layout, features
 
 
 def convert_output(fn):
@@ -449,7 +557,8 @@ def convert_output(fn):
                     x = x
                 else:
                     raise ValueError(f"Unsupported out='{out}' for JAX input")
-
+            elif isinstance(x, list):
+                return [_convert(elem) for elem in x]
             else:
                 raise TypeError(
                     f"Cannot convert type {type(x)} of {x} to '{out}'"
@@ -482,6 +591,24 @@ def convert_input(
             f'Cannot convert type {type(x)} of {x} to torch.Tensor'
         )
     return x
+
+
+def save_sheaf_plt(fn):
+    @wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        fn(self, *args, **kwargs)
+        path = os.path.join(os.getcwd(), 'plot')
+        if not os.path.exists(path):
+            os.makedirs(path)
+        save_path = os.path.join(
+            path,
+            f'{self.run.name}_{self.n_edges}_edges_{self.n_agents}_nodes.png',
+        )
+        plt.savefig(save_path)
+        print(f'Graph plot saved to {save_path}')
+        return None
+
+    return wrapper
 
 
 # ================================================================

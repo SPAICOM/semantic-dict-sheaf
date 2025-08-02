@@ -7,43 +7,35 @@ sys.path.append(str(Path(sys.path[0]).parent))
 
 from torch.utils.data import TensorDataset, DataLoader
 from pytorch_lightning import Trainer
-from scipy.linalg import dft
-from tqdm.auto import tqdm
-from igraph import Graph
-import jax.numpy as jnp
 from typing import Any
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
+from matplotlib import cm
+import jax.numpy as jnp
+import igraph as ig
 import numpy as np
 import torch
 
-from src.utils import random_stiefel, convert_output, convert_input, prewhiten
+
+# import matplotlib.patches as mpatches
+
+# from matplotlib.colors import Normalize
+from scipy.sparse import csgraph
+from wandb import Image
+
+from src.utils import (
+    layout_embedding,
+    save_sheaf_plt,
+    random_stiefel,
+    convert_output,
+    convert_input,
+    prewhiten,
+    n_atoms,
+)
 from src.datamodules import DataModuleClassifier
-from src.coder import SparseCoder
+from src.coder import SparseCoder, GlobalDict
 from src.neural import Classifier
-
-
-# def convert_output(fn):
-#     @wraps(fn)
-#     def wrapper(self, *args, out: str = 'torch', **kwargs):
-#         result = fn(self, *args, **kwargs)
-
-#         def convert(x: torch.Tensor):
-#             if x is None:
-#                 return x
-#             if out == 'numpy':
-#                 return x.detach().cpu().numpy()
-#             elif out == 'jax':
-#                 return jnp.array(x.detach().cpu().numpy())
-#             elif out == 'torch':
-#                 return x
-#             else:
-#                 raise ValueError(f"Unsupported out='{out}'")
-
-#         if isinstance(result, tuple):
-#             return tuple(convert(x) for x in result)
-#         else:
-#             return convert(result)
-
-#     return wrapper
 
 
 class Agent:
@@ -59,21 +51,33 @@ class Agent:
         testing: bool = False,
         **kwargs: Any,
     ):
-        self.id: int = id
-        self.model_name: str = model
-        self.dataset: str = dataset
         self.device: str = device
         self.seed: int = seed
-        self.S: torch.Tensor = None
-        self.restriction_maps: dict[int, torch.Tensor] = {}
-        # self.sparse_representations: dict[int, torch.Tensor] = {}
+        self.id: int = id
 
+        # ================================================================
+        #                     Neural Model's Parameters
+        # ================================================================
+        self.model_name: str = model
+        self.model: Classifier = None
+        self.loss = None
+        self.acc = 0.0
+
+        # ================================================================
+        #                 Agent's Latent Space and Maps
+        # ================================================================
+        self.datamodule: DataModuleClassifier = None
+        self.dataset: str = dataset
         if testing:
             self.X_train = kwargs['X_train']
             self.X_test = None
             self.stalk_dim = self.X_train.shape[0]
         else:
             self.latent_initialization()
+        self.S: torch.Tensor = None
+        self.D: torch.Tensor = None
+        self.sparsity: int = None
+        self.restriction_maps: dict[int, torch.Tensor] = {}
 
     def map_initialization(
         self,
@@ -86,6 +90,11 @@ class Agent:
             self.restriction_maps[neighbour_id] = random_stiefel(
                 edge_stalk_dim, self.stalk_dim
             ).to(self.device)
+        elif self.stalk_dim == edge_stalk_dim:
+            self.restriction_maps[neighbour_id] = torch.eye(
+                self.stalk_dim,
+                device=self.device,
+            )
         else:
             self.restriction_maps[neighbour_id] = torch.randn(
                 edge_stalk_dim,
@@ -93,19 +102,6 @@ class Agent:
                 device=self.device,
             )
 
-        return None
-
-    def sparse_initialization(
-        self,
-        coder_params: dict[Any] = {},
-    ) -> None:
-        """ """
-        X, _ = self.get_latent(prewhite=True, scale=True, out='numpy')
-        coder = SparseCoder(
-            X=X,
-            params=coder_params,
-        )
-        self.D, self.S = coder.fit(out='torch')
         return None
 
     def map_update(
@@ -135,6 +131,19 @@ class Agent:
         self.n_examples = self.X_train.shape[1]
         return None
 
+    def sparse_initialization(
+        self,
+        coder_params: dict[Any] = {},
+    ) -> None:
+        """ """
+        X, _ = self.get_latent(prewhite=False, scale=True, out='numpy')
+        coder = SparseCoder(
+            X=X,
+            params=coder_params,
+        )
+        self.D, self.S = coder.fit(out='torch')
+        return None
+
     def load_model(
         self,
         model_path: str,
@@ -162,26 +171,33 @@ class Agent:
         self,
         prewhite: bool = False,
         scale: bool = False,
+        subsampling: int = None,
         test: bool = False,
+        seed: int = 42,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if test:
-            X_tr, _, _, X_te = (
-                prewhiten(self.X_train, self.X_test)
-                if prewhite
-                else (self.X_train, None, None, self.X_test),
-            )
+            if prewhite:
+                X_tr, _, _, X_te = prewhiten(self.X_train, self.X_test)
+            else:
+                X_tr = self.X_train
+                X_te = self.X_test
         else:
-            X_tr, _, _ = (
-                prewhiten(self.X_train)
-                if prewhite
-                else (self.X_train, None, None)
-            )
-            X_te = None
+            if prewhite:
+                X_tr, _, _ = prewhiten(self.X_train, self.X_test)
+            else:
+                X_tr = self.X_train
+                X_te = None
+
         if scale:
             X_tr /= torch.norm(X_tr, p='fro')
             X_te = (
                 X_te / torch.norm(X_te, p='fro') if X_te is not None else X_te
             )
+
+        if subsampling is not None:
+            torch.manual_seed(seed)
+            X_tr = X_tr[:, torch.randperm(X_tr.size(1))]
+            X_tr = X_tr[:, :subsampling]
         return X_tr, X_te
 
 
@@ -205,6 +221,10 @@ class Edge:
             torch.eye(self.stalk_dim, device=self.device) if mask else None
         )
         self.loss: float = torch.inf
+
+    # ================================================================
+    #                 Edge Feature Retrieval Methods
+    # ================================================================
 
     @convert_output
     def get_restriction_maps(
@@ -265,6 +285,10 @@ class Edge:
         self,
     ) -> torch.Tensor:
         return self.mask
+
+    # ================================================================
+    #                 Edge Feature Updating Methods
+    # ================================================================
 
     def update_restriction_maps(
         self,
@@ -328,6 +352,7 @@ class Network:
         dictionary: torch.Tensor = None,
         mask_edges: bool = False,
         device: str = 'cpu',
+        run=None,
     ):
         self.edges: dict[tuple[int, int], Edge] = {}
         self.agents: dict[int, Agent] = {}
@@ -335,10 +360,20 @@ class Network:
         self.dictionary = dictionary
         self.device: str = device
         self.global_dim: int = 0
+        # self.globalDict: torch.Tensor = None
         self.n_agents: int = 0
         self.n_edges: int = 0
+        self.run = run
+
+        self.coder_params: dict[Any] = {
+            'prewhite': False,
+            'scale': False,
+            'subsampling': None,
+        }
+        self.coder_params.update(coder_params)
 
         # Init Agents
+        X_train = []
         for idx, info in agents_info.items():
             self.agents[idx] = Agent(
                 id=idx,
@@ -349,18 +384,27 @@ class Network:
                 testing=info.get('testing', False),
                 **info.get('kwargs', {}),
             )
+            X, _ = self.agents[idx].get_latent(
+                prewhite=self.coder_params['prewhite'],
+                scale=self.coder_params['scale'],
+                subsampling=self.coder_params['subsampling'],
+                out='numpy',
+            )
+            X_train.append(X)
+
         self.n_agents = len(self.agents)
+        X_train = np.hstack(X_train)
+
+        self.set_global_dictionary(
+            X_train,
+            dict_params=self.coder_params,
+        )
 
         # Init Edges
         if edges_info is None:
-            self.graph = Graph.Erdos_Renyi(
-                n=self.n_agents,
-                p=1.0,
-                directed=False,
-                loops=False,
-            )
+            self.graph = ig.Graph.Full(n=self.n_agents)
         else:
-            self.graph = Graph()
+            self.graph = ig.Graph()
             self.graph.add_vertices(self.n_agents)
             self.graph.add_edges(list(edges_info.keys()))
 
@@ -381,8 +425,6 @@ class Network:
             self.agents[j].map_initialization(
                 neighbour_id=i, edge_stalk_dim=e_stalk
             )
-            self.agents[i].sparse_initialization(coder_params=coder_params)
-            self.agents[j].sparse_initialization(coder_params=coder_params)
             self.edges[(i, j)] = Edge(
                 head=self.agents[i],
                 tail=self.agents[j],
@@ -392,7 +434,31 @@ class Network:
             )
         self.n_edges = len(self.edges)
         self._is_connection_graph()
-        del agents_info, edges_info, coder_params
+        del agents_info, edges_info
+
+    def set_global_dictionary(
+        self,
+        X_train: np.ndarray,
+        dict_params: dict[Any] = {},
+    ) -> None:
+        GD = GlobalDict(
+            X=X_train,
+            agents=self.agents,
+            n_nodes=self.n_agents,
+            params=dict_params,
+            run=self.run,
+        )
+        DD, SS = GD.fit(out='torch')
+
+        for i in range(self.n_agents):
+            self.agents[i].S = SS[i]
+            self.agents[i].sparsity = n_atoms(self.agents[i].S)
+            # print(f'Agent-{i} S: {self.agents[i].S}')
+            self.agents[i].D = DD[i]
+
+        self.dict_metrics = GD.return_metrics()
+
+        return None
 
     def _is_connection_graph(
         self,
@@ -418,6 +484,7 @@ class Network:
         n_edges: int,
     ) -> None:
         """Update the graph based on the edge losses."""
+        # print(self.graph.get_edgelist())
         assert (n_edges > 0) and (n_edges <= len(self.graph.get_edgelist())), (
             'n_edges must be a positive integer, smaller than the current number of edges in the graph.'
         )
@@ -429,310 +496,287 @@ class Network:
         eids = self.graph.get_eids(to_remove, directed=False, error=False)
         eids = [eid for eid in eids if eid >= 0]
         self.graph.delete_edges(eids)
+        self.n_edges = n_edges
 
-    #######################################################################################
+    def prepare_message(
+        self,
+        tx_id: int,
+    ) -> torch.Tensor:
+        """Prepare the message to be sent from tx_id to rx_id."""
 
-    # def update_restriction_maps(
+        _, X_te = self.agents[tx_id].get_latent(
+            prewhite=False,
+            scale=True,
+            test=True,
+            out='numpy',
+        )
+        coder = SparseCoder(
+            X=X_te,
+            dict_type='pca',
+            params=self.coder_params,
+        )
+        _, S = coder.fit(out='torch')
+        message = self.agents[tx_id].D @ S
+        return message
+
+    def send_message(
+        self,
+        tx_id: int,
+        rx_id: int,
+    ) -> torch.Tensor:
+        """ """
+
+        # message = self.prepare_message(tx_id=tx_id)
+
+        try:
+            mask = self.edges[(tx_id, rx_id)].mask
+        except KeyError:
+            mask = self.edges[(rx_id, tx_id)].mask
+
+        # print(f'{self.agents[tx_id].D.shape=}')
+        # print(f'{self.agents[rx_id].restriction_maps[tx_id].T.shape=}')
+        # print(f'{self.agents[tx_id].restriction_maps[rx_id].shape=}')
+        # print(f'{message.shape=}')
+
+        message = (
+            (
+                self.agents[rx_id].restriction_maps[tx_id].T
+                @ self.agents[tx_id].restriction_maps[rx_id]
+                @ self.agents[tx_id].X_test
+            )
+            if mask is None
+            else (
+                self.agents[rx_id].restriction_maps[tx_id].T
+                @ mask
+                @ self.agents[tx_id].restriction_maps[rx_id]
+                @ self.agents[tx_id].X_test
+            )
+        )
+        return message
+
+    def test_agent_model(
+        self,
+        agent_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """ """
+        trainer: Trainer = Trainer(
+            inference_mode=True,
+            enable_progress_bar=False,
+            logger=False,
+            accelerator=self.device,
+        )
+        losses: dict[int, float] = {}
+        accuracy: dict[str, float] = {}
+        neighbors: list[int] = self.graph.neighbors(agent_id)
+        for rx_id in neighbors:
+            # Send the message from the input agent to one of its neighbors
+            rx_data = self.send_message(
+                tx_id=agent_id,
+                rx_id=rx_id,
+            )
+
+            self.agents[rx_id].load_model(
+                model_path=f'models/classifiers/{self.agents[rx_id].dataset}/{self.agents[rx_id].model_name}/seed_{self.agents[rx_id].seed}.ckpt'
+            )
+            acc, loss = self.agents[rx_id].test_model(
+                data=rx_data,
+                trainer=trainer,
+            )
+            accuracy[
+                f'Agent-{rx_id} ({self.agents[rx_id].model_name}) - Task Accuracy (Test)'
+            ] = acc
+
+            losses[
+                f'Agent-{rx_id} ({self.agents[rx_id].model_name}) - MSE loss (Test)'
+            ] = loss
+
+        return torch.mean(torch.tensor(list(accuracy.values()))), torch.mean(
+            torch.tensor(list(losses.values()))
+        )
+
+    def eval(
+        self,
+        verbose: bool = False,
+    ) -> None:
+        """ """
+        for i, agent in self.agents.items():
+            acc, loss = self.test_agent_model(agent_id=i)
+            if verbose:
+                print(
+                    f'Agent-{i} ({agent.model_name}) - Task Accuracy (Test): {acc}'
+                )
+                print(f'Agent-{i} ({agent.model_name}) - Loss (Test): {loss}')
+            if self.run is not None:
+                self.run.log(
+                    {
+                        f'Agent-{i} ({agent.model_name}) - Task Accuracy (Test)': acc,
+                        f'Agent-{i} ({agent.model_name}) - Loss (Test)': loss,
+                    }
+                )
+            agent.acc, agent.loss = (acc, loss)
+        return None
+
+    # @save_sheaf_plt
+    # def sheaf_plot(
     #     self,
-    #     edge: tuple[int, int],
-    #     F_j: torch.Tensor,
-    #     F_i: torch.Tensor = None,
-    #     Z_ij: torch.Tensor = None,
+    #     layout: List[Tuple[int]] = None,
+    #     with_labels: bool = True,
+    #     n_clusters: int = 2,
+    #     seed: int = 42,
     # ) -> None:
-    #     """ """
-    #     i, j = edge
-    #     if F_i is None:
-    #         F_i = torch.eye(self.agents[i].stalk_dim, device=self.device)
-    #     self.agents[i].map_update(j, F_j)
-    #     self.agents[j].map_update(i, F_i)
-    #     self.edges[edge] = Z_ij
-    #     return None
+    #     """Plot the sheaf as a graph."""
 
-    # def send_message(
-    #     self,
-    #     tx_id: int,
-    #     rx_id: int,
-    #     message: torch.Tensor,
-    # ) -> torch.Tensor:
-    #     """ """
-    #     if self.edge_masks[(tx_id, rx_id)] is None:
-    #         return (
-    #             self.agents[rx_id].restriction_maps[tx_id].T
-    #             @ self.agents[tx_id].restriction_maps[rx_id]
-    #             @ message
-    #         )
-    #     return (
-    #         self.agents[rx_id].restriction_maps[tx_id].T
-    #         @ self.edge_masks[(tx_id, rx_id)]
-    #         @ self.agents[tx_id].restriction_maps[rx_id]
-    #         @ message
+    #     # Edge plotting distances
+    #     edge_losses = {edge.id: edge.loss for edge in self.edges.values()}
+    #     weights = []
+    #     for e in self.graph.es:
+    #         weights.append(edge_losses[tuple(sorted([e.source, e.target]))])
+    #     self.graph.es['weight'] = weights
+    #     self.graph.es['label'] = [f'{w:.2f}' for w in weights]
+
+    #     # Layout coordinates
+    #     layout, features = layout_embedding(
+    #         graph=self.graph,
+    #         layout=layout,
+    #         seed=seed,
     #     )
 
-    # def edge_loss(
-    #     self,
-    #     edge: tuple[int, int],
-    #     S_t: torch.Tensor = None,
-    #     beta: float = None,
-    #     penalized: bool = False,
-    #     lambda_: float = None,
-    #     F_ij: torch.Tensor = None,
-    #     F_ji: torch.Tensor = None,
-    #     S_i: torch.Tensor = None,
-    #     S_j: torch.Tensor = None,
-    #     D: torch.Tensor = None,
-    #     gamma1: float = None,
-    #     gamma2: float = None,
-    # ) -> tuple[float, float, float]:
-    #     """Compute the edge loss between two agents."""
-    #     i, j = edge
-    #     F_ij = self.agents[i].restriction_maps[j] if F_ij is None else F_ij
-    #     F_ji = self.agents[j].restriction_maps[i] if F_ji is None else F_ji
-    #     S_i = self.agents[i].sparse_representations[j] if S_i is None else S_i
-    #     S_j = self.agents[j].sparse_representations[i] if S_j is None else S_i
-    #     X_i = self.agents[i].X_train
-    #     X_j = self.agents[j].X_train
-    #     semantic_alignment = (
-    #         torch.norm(F_ij @ X_i - F_ji @ X_j, p='fro')
-    #         if S_t is None
-    #         else torch.norm(S_t @ (F_ij @ X_i - F_ji @ X_j), p='fro')
-    #     )
-    #     communication_loss = (
-    #         torch.norm(X_i - F_ij.T @ F_ji @ X_j, p='fro')
-    #         + torch.norm(X_j - F_ji.T @ F_ij @ X_i, p='fro')
-    #         if S_t is None
-    #         else torch.norm(X_i - F_ij.T @ S_t @ F_ji @ X_j, p='fro')
-    #         + torch.norm(X_j - F_ji.T @ S_t @ F_ij @ X_i, p='fro')
-    #     )
-    #     loss = (
-    #         semantic_alignment
-    #         if self.is_connection_graph
-    #         else (1 - beta) * semantic_alignment + beta * communication_loss
-    #     )
-
-    #     assert (penalized == True) + (S_t is not None) != 1, (
-    #         'penalized must be True if S_t is not None, and vice versa.'
-    #     )
-    #     if penalized:
-    #         loss += lambda_ * torch.norm(torch.diag(S_t), p=1)
-
-    #     if S_i is not None:
-    #         loss += (
-    #             torch.norm(X_i - D @ S_i, p=2)
-    #             + torch.norm(X_j - D @ S_j, p=2)
-    #             + gamma1 * torch.linalg.norm(S_j, ord=2, dim=1).sum()
-    #             + gamma2 * torch.linalg.norm(S_i, ord=2, dim=1).sum()
-    #         )
-    #     return loss, semantic_alignment, communication_loss
-
-    # def edge_augmented_lagrangian(
-    #     self,
-    #     edge: tuple[int, int],
-    #     S_t: np.ndarray,
-    #     alpha: float,
-    #     U_i: np.ndarray,
-    #     U_j: np.ndarray,
-    #     Y_i: np.ndarray,
-    #     Y_j: np.ndarray,
-    #     beta: float = None,
-    #     penalized: bool = None,
-    #     lambda_: float = None,
-    #     F_ij: torch.Tensor = None,
-    #     F_ji: torch.Tensor = None,
-    # ) -> float:
-    #     U_i = torch.from_numpy(U_i.astype(np.float32))
-    #     U_j = torch.from_numpy(U_j.astype(np.float32))
-    #     Y_i = torch.from_numpy(Y_i.astype(np.float32))
-    #     Y_j = torch.from_numpy(Y_j.astype(np.float32))
-    #     S_t = (
-    #         torch.from_numpy(S_t.astype(np.float32))
-    #         if S_t is not None
+    #     # Nodes plotting labels
+    #     self.graph.vs['label'] = (
+    #         [
+    #             f'{agent.id}: {agent.model_name} \nAcc: {agent.acc:.2f} - Loss: {agent.loss:.2f}'
+    #             for agent in self.agents.values()
+    #         ]
+    #         if with_labels
     #         else None
     #     )
-    #     F_ij = (
-    #         torch.from_numpy(F_ij.astype(np.float32))
-    #         if F_ij is not None
-    #         else F_ij
+
+    #     # Nodes plotting colors
+    #     kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(features)
+    #     self.graph.vs['cluster'] = kmeans.labels_
+    #     colors = cm.get_cmap('Set1', np.max(kmeans.labels_) + 1)
+    #     self.graph.vs['color'] = [colors(c) for c in self.graph.vs['cluster']]
+
+    #     _, ax = plt.subplots(figsize=(20, 20))
+    #     plt.title(f"Sheaf learned with '{self.run.name}' algorithm")
+    #     ig.plot(
+    #         self.graph,
+    #         target=ax,
+    #         layout=layout,
+    #         vertex_label=self.graph.vs['label'],
+    #         edge_label=self.graph.es['label'],
+    #         vertex_color=self.graph.vs['color'],
+    #         bbox=(300, 300),
+    #         margin=40,
     #     )
-    #     F_ji = (
-    #         torch.from_numpy(F_ji.astype(np.float32))
-    #         if F_ji is not None
-    #         else F_ji
-    #     )
-    #     loss, sem, comm = self.edge_loss(
-    #         edge=edge,
-    #         S_t=S_t,
-    #         beta=beta,
-    #         penalized=penalized,
-    #         lambda_=lambda_,
-    #         F_ij=F_ij,
-    #         F_ji=F_ji,
-    #     )
-    #     dual_loss = (alpha / 2) * (
-    #         torch.norm(F_ji.T - Y_j + U_j, p='fro') ** 2
-    #         + torch.norm(F_ij.T - Y_i + U_i, p='fro') ** 2
-    #     )
-    #     return loss, sem, comm, dual_loss
+    #     return None
 
-    # def edge_loss_grad(
-    #     self,
-    #     edge: tuple[int, int],
-    #     S_t: np.ndarray,
-    #     beta: float,
-    #     autodiff: bool = True,
-    # ) -> np.ndarray:
-    #     """Compute the edge loss gradient."""
-    #     if autodiff:
-    #         S_t = torch.tensor(
-    #             S_t,
-    #             dtype=torch.float32,
-    #             device=self.device,
-    #             requires_grad=True,
-    #         )
-    #         loss, _, _ = self.edge_loss(
-    #             edge=edge,
-    #             S_t=S_t,
-    #             beta=beta,
-    #             penalized=False,
-    #         )
-    #         loss.backward()
-    #         # return S_t.grad.detach().cpu().numpy()
-    #         return S_t.grad.numpy()
-    #     else:
-    #         return None
+    @save_sheaf_plt
+    def sheaf_plot(
+        self,
+        layout: list[tuple[int]] = None,
+        with_labels: bool = True,
+        n_clusters: int = 2,
+        seed: int = 42,
+    ) -> None:
+        """Plot the sheaf with spectral clustering and custom aesthetics using igraph."""
 
-    # def compute_edge_losses(
-    #     self,
-    #     dictionary: torch.Tensor = None,
-    #     beta: float = None,
-    #     lambda_: float = None,
-    #     gamma1: float = None,
-    #     gamma2: float = None,
-    # ) -> dict[tuple[int, int], float]:
-    #     """Compute the edge losses for all edges in the graph."""
-    #     edge_losses: dict[tuple[int, int], float] = {}
-    #     penalized = False if lambda_ is None else True
-    #     for i, j in self.graph.get_edgelist():
-    #         edge_losses[(i, j)], _, _ = self.edge_loss(
-    #             edge=(i, j),
-    #             S_t=self.edge_masks[(i, j)],
-    #             beta=beta,
-    #             penalized=penalized,
-    #             lambda_=lambda_,
-    #             gamma1=gamma1,
-    #             gamma2=gamma2,
-    #             D=dictionary,
-    #         )
-    #     return edge_losses
+        # Edge weights and labels
+        edge_losses = {edge.id: edge.loss for edge in self.edges.values()}
+        weights = [
+            edge_losses[tuple(sorted([e.source, e.target]))]
+            for e in self.graph.es
+        ]
+        self.graph.es['weight'] = weights
+        self.graph.es['label'] = [f'{w:.2f}' for w in weights]
 
-    # def update_graph(
-    #     self,
-    #     n_edges: int,
-    #     dictionary: torch.Tensor = None,
-    #     beta: float = None,
-    #     lambda_: float = None,
-    #     gamma1: float = None,
-    #     gamma2: float = None,
-    # ) -> None:
-    #     """Update the graph based on the edge losses."""
-    #     assert (n_edges > 0) and (n_edges <= len(self.graph.get_edgelist())), (
-    #         'n_edges must be a positive integer, smaller than the current number of edges in the graph.'
-    #     )
+        # Layout
+        layout, _ = layout_embedding(
+            graph=self.graph, layout=layout, seed=seed
+        )
 
-    #     edge_losses = self.compute_edge_losses(
-    #         beta=beta,
-    #         lambda_=lambda_,
-    #         gamma1=gamma1,
-    #         gamma2=gamma2,
-    #         dictionary=dictionary,
-    #     )
-    #     to_remove = list(
-    #         dict(sorted(edge_losses.items(), key=lambda item: item[1])).keys()
-    #     )[n_edges:]
-    #     eids = self.graph.get_eids(to_remove, directed=False, error=False)
-    #     eids = [eid for eid in eids if eid >= 0]
-    #     self.graph.delete_edges(eids)
+        # Spectral clustering using graph Laplacian
+        n = len(self.graph.vs)
+        A = np.zeros((n, n))
+        for e in self.graph.es:
+            A[e.source, e.target] = A[e.target, e.source] = e['weight']
 
-    # def test_agent_model(
-    #     self,
-    #     agent_id: int,
-    #     dataset: str = 'cifar10',
-    #     seed: int = 42,
-    # ) -> torch.Tensor:
-    #     """ """
-    #     trainer: Trainer = Trainer(
-    #         inference_mode=True,
-    #         enable_progress_bar=False,
-    #         logger=False,
-    #         accelerator=self.device,
-    #     )
-    #     losses: dict[int, float] = {}
-    #     accuracy: dict[str, float] = {}
-    #     neighbors: list[int] = self.graph.neighbors(agent_id)
-    #     for rx_id in neighbors:
-    #         # Send the message from the input agent to one of its neighbors
-    #         rx_data = self.send_message(
-    #             tx_id=agent_id,
-    #             rx_id=rx_id,
-    #             message=self.agents[agent_id].X_test,
-    #         )
+        L = csgraph.laplacian(A, normed=False)
+        eigvals, eigvecs = np.linalg.eigh(L)
+        X = eigvecs[:, 1 : n_clusters + 1]
+        kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(X)
+        cluster_labels = kmeans.labels_.tolist()  # Convert to Python list
+        self.graph.vs['cluster'] = cluster_labels
 
-    #         self.agents[rx_id].load_model(
-    #             model_path=f'models/classifiers/{dataset}/{self.agents[rx_id].model_name}/seed_{self.agents[rx_id].seed}.ckpt'
-    #         )
-    #         acc, loss = self.agents[rx_id].test_model(
-    #             data=rx_data,
-    #             trainer=trainer,
-    #         )
-    #         accuracy[
-    #             f'Agent-{rx_id} ({self.agents[rx_id].model_name}) - Task Accuracy (Test)'
-    #         ] = acc
+        # Node color based on accuracy, mapped to [0.5, 1.0] in RdYlGn colormap
+        accs = np.array([agent.acc for agent in self.agents.values()])
+        acc_norm = (accs - accs.min()) / (np.ptp(accs) + 1e-6)
+        acc_scaled = 0.5 + acc_norm * 0.5
+        cmap = cm.get_cmap('RdYlGn')
+        self.graph.vs['color'] = [cmap(a) for a in acc_scaled]
 
-    #         losses[
-    #             f'Agent-{rx_id} ({self.agents[rx_id].model_name}) - MSE loss (Test)'
-    #         ] = loss
+        # Node size based on sparsity
+        min_size = 10
+        max_size = 40
+        sparsities = np.array(
+            [agent.sparsity for agent in self.agents.values()]
+        )
+        sparsity_min = sparsities.min()
+        sparsity_max = sparsities.max()
+        sparsity_range = sparsity_max - sparsity_min + 1e-6
+        normalized_sizes = min_size + (
+            (sparsities - sparsity_min) / sparsity_range
+        ) * (max_size - min_size)
+        self.graph.vs['size'] = normalized_sizes.tolist()
 
-    #     return torch.mean(torch.tensor(list(accuracy.values()))), torch.mean(
-    #         torch.tensor(list(losses.values()))
-    #     )
+        # Edge color in greyscale (to fake alpha fading)
+        norm_weights = (np.array(weights) - min(weights)) / (
+            max(weights) - min(weights) + 1e-5
+        )
+        greys = cm.get_cmap('Greys')
+        self.graph.es['color'] = [
+            greys(0.3 + 0.7 * (1 / w + 1e-6)) for w in norm_weights
+        ]
 
-    # def eval(
-    #     self,
-    #     dataset: str = 'cifar10',
-    #     seed: int = 42,
-    #     verbose: bool = False,
-    # ) -> None:
-    #     """ """
-    #     agents_metrics: dict[int, tuple[float, float]] = {}
-    #     for i in range(self.n_agents):
-    #         acc, loss = self.test_agent_model(
-    #             agent_id=i,
-    #             dataset=dataset,
-    #             seed=seed,
-    #         )
-    #         if verbose:
-    #             print(
-    #                 f'Agent-{i} ({self.agents[i].model_name}) - Task Accuracy (Test): {acc}'
-    #             )
-    #             print(
-    #                 f'Agent-{i} ({self.agents[i].model_name}) - MSE loss (Test): {loss}'
-    #             )
-    #         agents_metrics[i] = (acc, loss)
-    #     return agents_metrics
+        # Labels
+        if with_labels:
+            self.graph.vs['label'] = [
+                f'{agent.id}: {agent.model_name}\nAcc: {agent.acc:.2f} - N. Atoms: {agent.sparsity}'
+                for agent in self.agents.values()
+            ]
+        else:
+            self.graph.vs['label'] = None
 
+        # Clustering groups for `mark_groups`
+        mark_groups = [[] for _ in range(n_clusters)]
+        for idx, label in enumerate(cluster_labels):
+            mark_groups[label].append(idx)
 
-def set_global_dictionary(
-    dictionary_type: str,
-    n: int,
-    n_atoms: int = None,
-) -> None:
-    if dictionary_type == 'fourier':
-        D = dft(n, scale='sqrtn')
-    elif dictionary_type == 'learnable':
-        pass
-        # D = np.zeros((self.stalk_dim, self.n_atoms))
-    else:
-        pass
-    return D
+        # Plotting
+        _, ax = plt.subplots(figsize=(20, 20))
+        plt.title(f"Sheaf learned with '{self.run.name}' algorithm")
+
+        ig.plot(
+            self.graph,
+            target=ax,
+            layout=layout,
+            vertex_color=self.graph.vs['color'],
+            vertex_size=self.graph.vs['size'],
+            vertex_label=self.graph.vs['label'],
+            edge_color=self.graph.es['color'],
+            edge_label=self.graph.es['label'],
+            # mark_groups=mark_groups,
+            # mark_color=[(0.8, 0.8, 0.8, 0.2)] * n_clusters,
+            bbox=(300, 300),
+            margin=40,
+        )
+        plt.tight_layout()
+        self.run.log({'final_network': Image(plt)})
+        # self.run.summary['final_network'] = Image(plt)
+
+    def return_metrics(self) -> dict[str, float]:
+        """Compute the dictionary metrics for each agent."""
+        return self.dict_metrics
 
 
 def main():
@@ -754,6 +798,7 @@ def main():
         'explained_variance': 0.9,
         'sparsity_level': 0.1,
         'regularizer': 1e-3,
+        'dict_type': None,
         'n_atoms': None,
         'dictionary_type': 'fourier',
         'max_iter': 100,
@@ -769,7 +814,7 @@ def main():
         dataset=agents[0]['dataset'],
         seed=agents[0]['seed'],
     )
-    X, _ = agent.get_latent(prewhite=True, out='numpy')
+    X, _ = agent.get_latent(scale=True, prewhite=True, test=True, out='numpy')
 
     print('Learning the sparse representation...', end='\t')
     coder = SparseCoder(
@@ -783,6 +828,16 @@ def main():
     # =============================================================
     #                 TEST NETWORK INITIALIZATION
     # =============================================================
+    coder_params = {
+        'init_mode': 'random',
+        'regularizer': 1e-3,
+        'dict_type': None,
+        'n_atoms': 400,
+        'max_iter': 100,
+        'Dstep': 1,
+        'Sstep': 1,
+        'tol': 1e-3,
+    }
     print('Preparing the network...')
     Network(
         agents_info=agents,

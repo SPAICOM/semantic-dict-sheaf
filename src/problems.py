@@ -37,6 +37,7 @@ class EdgeProblem:
         )
         self.Z_ij = self.edge.get_mask(out='numpy')
         self.D_i, self.D_j = self.edge.get_dictionaries(out='numpy')
+        self.N = self.X_i.shape[1]
 
         # ================================================================
         #                          Parameters
@@ -114,9 +115,8 @@ class EdgeProblem:
     # ================================================================
     def fit(self):
         """Update restriction maps solving orthogonal Procrustes problem"""
-        U, _, Vt = svd(self.cov_j @ self.cov_i.T)
-        self.F_j = U @ Vt
-        # print(f'Edge {self.edge.id} map: \n {self.F_j}')
+        U, _, Vt = svd((self.cov_j @ self.cov_i.T) / self.N)
+        self.F_j = (U @ Vt).T
         self.eval()
         self.update_edge()
         return None
@@ -187,9 +187,10 @@ class EdgeProblemProcrustes(EdgeProblem):
         """Update restriction maps solving orthogonal Procrustes problem
         on a common subspace.
         """
-        U, _, Vt = svd(self.D_j @ self.S_j @ self.S_i.T @ self.D_i.T)
-        self.F_j = U @ Vt
-        # print(f'Edge {self.edge.id} map: \n {self.F_j}')
+        U, _, Vt = svd(
+            self.D_j @ (self.S_j @ self.S_i.T) / self.N @ self.D_i.T
+        )
+        self.F_j = (U @ Vt).T
         self.eval()
         self.update_edge()
         return None
