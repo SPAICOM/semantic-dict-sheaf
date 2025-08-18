@@ -179,3 +179,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Project local folders
+artifacts/
+semantic_network_formation_sheaves__classifier/
+models/

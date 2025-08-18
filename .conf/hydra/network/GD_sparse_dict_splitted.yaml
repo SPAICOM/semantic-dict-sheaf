@@ -1,0 +1,51 @@
+seed: 42
+device: cpu
+
+network:
+  path: toy_example
+  p_edges: 1
+  mask_restrictions: False
+  connection_graph: False
+  models:
+    - vit_small_patch16_224:
+      - cifar10
+      - 42
+    - vit_small_patch32_224:
+      - cifar10
+      - 42
+    - vit_small_patch32_384:
+      - cifar10
+      - 42
+    - vit_small_patch16_384:
+      - cifar10
+      - 42
+
+algorithm:
+  n_iters: 200
+  alpha: 1
+  proximal_stepsize: 1e-4
+  sparse_regularizer_head: 1e-3
+  sparse_regularizer_tail: 1e-3
+  explained_variance: null
+  verbose: true
+  n_edges: 5
+  plotting_nclusters: 3
+
+coder:
+  split: null
+  dict_type: learnable
+  init_mode_dict: random
+  init_mode_sparse: random
+  regularizer: 1e-4
+  n_atoms: 800
+  max_iter: 200
+  tol: 1e-6
+  Dstep: 1e-1
+  Sstep: 1e-3
+  momentum: 0.9
+  D_iters: 1
+  S_iters: 10
+  patience: 5
+
+wandb:
+  project: GD_both

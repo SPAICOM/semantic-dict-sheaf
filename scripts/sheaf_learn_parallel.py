@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(sys.path[0]).parent))
 
-from src.linear import Network
+from src.sheaf import Network
 from typing import Any
 import numpy as np
 import jax.numpy as jnp
