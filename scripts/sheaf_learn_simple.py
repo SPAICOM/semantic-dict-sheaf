@@ -157,31 +157,8 @@ def main(cfg) -> None:
     # # coder_params['dict_type'] = None
 
     regs = [
-        # 1e-6,
-        # 1e-5,
-        # 1e-4,
-        # 1e-3,
-        # 1e-2,
-        # 1e-1,
-        # 5e-1,
-        # 1.0,
-        # 5.0,
-        # 1e1,
-        # 20.0,
-        # 30.0,
-        # 40.0,
-        # 60.0,
-        # 70.0,
-        80.0,
-        # 5e1,
-        # 1e2,
-        # 5e2,
-        # 1e3,
-        # 5e3,
-        # 1e4,
-        # 1e5,
+        1e3,
     ]
-
     for reg in regs:
         rcode = np.random.randint(0, 1000)
         coder_params['regularizer'] = reg
@@ -192,7 +169,6 @@ def main(cfg) -> None:
             # + f'stepS{coder_params["Sstep"]}_'
             # + f'stepD{coder_params["Dstep"]}_'
             # + f'Diter{coder_params["D_iters"]}_'
-            + f'Sinit{coder_params["init_mode_sparse"]}_'
             + f'{rcode}'
         )
         run = wandb.init(
@@ -221,7 +197,7 @@ def main(cfg) -> None:
 
         metrics = net.return_metrics()
         metrics['seed'] = cfg.seed
-        metrics['regularizer'] = reg
+        metrics['lambda'] = cfg.coder.regularizer
         metrics['dict_type'] = cfg.coder.dict_type
         metrics['simulation'] = cfg.simulation
         metrics['augmented_multiplier_dict'] = (

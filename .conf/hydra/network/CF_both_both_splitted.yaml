@@ -38,7 +38,7 @@ coder:
   dict_type: learnable
   init_mode_dict: random
   init_mode_sparse: fourier
-  regularizer: 1e-2
+  regularizer: 1e-4
   n_atoms: null
   max_iter: 50
   tol: 1e-6
