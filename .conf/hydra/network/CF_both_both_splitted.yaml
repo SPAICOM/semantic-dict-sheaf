@@ -1,6 +1,7 @@
 seed: 42
 device: cpu
 simulation: CF_both_both_splitted
+save_results: True
 
 network:
   path: toy_example
@@ -21,31 +22,33 @@ network:
       - cifar10
       - 42
 
-algorithm:
-  n_iters: 200
-  alpha: 1
-  proximal_stepsize: 1e-4
-  sparse_regularizer_head: 1e-3
-  sparse_regularizer_tail: 1e-3
-  explained_variance: null
+alignment:
+  problem: procrustes
   verbose: true
   n_edges: 5
   plotting_nclusters: 3
 
 coder:
-  subsampling: 5000
+  n_subsampling: 4000
+  subsampling_strategy: proto
   split: both
   dict_type: learnable
-  init_mode_dict: random
+  init_mode_dict: fourier
   init_mode_sparse: fourier
-  regularizer: 1e-4
+  regularizer: 200
   n_atoms: null
-  max_iter: 50
+  max_iter: 2000
   tol: 1e-6
-  patience: 5
+  patience: 30
   hard_thresh: false
   augmented_multiplier_dict: 1
   augmented_multiplier_sparse: 1
 
 wandb:
   project: CF_both_both_splitted
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # coder.regularizer: 5, 20, 30, 40, 50, 60, 70, 80, 90 

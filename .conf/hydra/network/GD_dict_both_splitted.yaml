@@ -1,6 +1,7 @@
 seed: 42
 device: cpu
 simulation: GD_dict_both_splitted
+save_results: True
 
 network:
   path: toy_example
@@ -21,35 +22,37 @@ network:
       - cifar10
       - 42
 
-algorithm:
-  n_iters: 200
-  alpha: 1
-  proximal_stepsize: 1e-4
-  sparse_regularizer_head: 1e-3
-  sparse_regularizer_tail: 1e-3
-  explained_variance: null
+alignment:
+  problem: procrustes
   verbose: true
-  n_edges: 6
+  n_edges: 5
   plotting_nclusters: 3
 
 coder:
-  subsampling: 5000
+  subsampling: 4000
   split: both
   dict_type: learnable
-  init_mode_dict: random
+  init_mode_dict: fourier
   init_mode_sparse: fourier
-  regularizer: 5e-5
+  regularizer: 8e1
   n_atoms: null
-  max_iter: 50
+  max_iter: 2000
   tol: 1e-6
-  Dstep: 1e-4
+  Dstep: 1e-5 #1e-4
+  best_stepsize: false
   momentum: null
   hard_thresh: false
   use_CG: false
   D_iters: 1
-  patience: 5
+  patience: 30
   augmented_multiplier_dict: 1
   augmented_multiplier_sparse: 1
 
 wandb:
   project: GD_dict_both_splitted
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # coder.Dstep: 1e-7, 1e-6, 1e-5, 1e-4, 1e-3

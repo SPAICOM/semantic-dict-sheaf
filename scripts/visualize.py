@@ -47,8 +47,9 @@ def read_files(setup: str) -> pl.DataFrame:
         match = pattern.search(file.stem)
         if match:
             df = pl.read_parquet(file)
-            if 'regularizer' in df.columns:
-                df = df.with_columns(pl.col('regularizer').cast(pl.Float64))
+            print(df.columns)
+            if 'lambda' in df.columns:
+                df = df.with_columns(pl.col('lambda').cast(pl.Float64))
                 dfs.append(df)
 
     # Concatenate all dataframes into one
@@ -59,16 +60,16 @@ def read_files(setup: str) -> pl.DataFrame:
         print(f'No files found matching the pattern in {folder}.')
 
     print(final_df.columns)
-    print(final_df.filter(pl.col('regularizer') == 100000))
+    print(final_df.filter(pl.col('lambda') == 100000))
     return final_df
 
 
 # def regularization_plot(df: pl.DataFrame) -> None:
 #     # pdf = dfs.to_pandas()
-#     sns.lineplot(data=df, x='regularizer', y='nmse')
+#     sns.lineplot(data=df, x='lambda', y='nmse')
 #     plt.show()
 
-#     sns.lineplot(data=df, x='regularizer', y='sparsity', hue='agent_id')
+#     sns.lineplot(data=df, x='lambda', y='sparsity', hue='agent_id')
 #     plt.show()
 #     return None
 
@@ -76,30 +77,32 @@ def read_files(setup: str) -> pl.DataFrame:
 def regularization_plot(df: pl.DataFrame) -> None:
     pdf = df.to_pandas()
 
-    # Ensure numeric sorting on the x-axis if 'regularizer' is numeric
-    if not str(pdf['regularizer'].dtype).startswith(('float', 'int')):
-        pdf['regularizer'] = pd.to_numeric(pdf['regularizer'], errors='ignore')
+    # Ensure numeric sorting on the x-axis if 'lambda' is numeric
+    if not str(pdf['lambda'].dtype).startswith(('float', 'int')):
+        pdf['lambda'] = pd.to_numeric(pdf['lambda'], errors='ignore')
 
-    # xticks = sorted(pdf['regularizer'].unique())
+    # xticks = sorted(pdf['lambda'].unique())
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=False)
 
     # NMSE vs regularizer
-    sns.lineplot(data=pdf, x='regularizer', y='nmse', ax=axes[0])
+    sns.lineplot(data=pdf, x='lambda', y='nmse', ax=axes[0])
     axes[0].set_title('NMSE vs Regularizer')
     axes[0].set_xlabel('Regularizer')
     axes[0].set_ylabel('NMSE')
     axes[0].grid(True, axis='y')
+    axes[0].set_xscale('log')
 
     # Sparsity vs regularizer, colored by agent
     sns.lineplot(
-        data=pdf, x='regularizer', y='sparsity', hue='agent_id', ax=axes[1]
+        data=pdf, x='lambda', y='sparsity', hue='agent_id', ax=axes[1]
     )
     axes[1].set_title('Sparsity vs Regularizer')
     axes[1].set_xlabel('Regularizer')
     axes[1].set_ylabel('Sparsity')
     axes[1].grid(True, axis='y')
     axes[1].legend(title='Agent', loc='best')
+    axes[1].set_xscale('log')
 
     plots_dir = (
         Path.cwd().parent / 'plot'

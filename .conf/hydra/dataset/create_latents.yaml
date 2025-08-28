@@ -9,4 +9,22 @@ perc: 1.0
 val_perc: 0.15
 
 models:
-  - vit_small_patch32_384
+  - efficientvit_b2
+  - efficientvit_m4
+  - efficientvit_m5
+  - lcnet_075
+  - levit_128
+  - levit_128s
+  - levit_192
+  - levit_conv_128
+  - levit_conv_128s
+  - levit_conv_192
+  - volo_d1_224
+  - volo_d1_384
+  - xcit_small_12_p16_224
+  - xcit_small_12_p16_384
+  - cait_s24_224
+  - cait_s24_384
+  - cait_s36_384
+  - convnext_femto
+  - convnext_femto_ols

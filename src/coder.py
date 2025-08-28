@@ -83,6 +83,8 @@ class SparseCoder:
         pca.fit(self.X.T)
         self.D = pca.components_.T
         self.S = pca.transform(self.X.T).T
+
+        print(self.D.shape, self.S.shape)
         return None
 
     def _sparse_coding_lasso(
@@ -147,7 +149,7 @@ class SparseCoder:
         if self.D is None:
             self._set_dictionary()
         else:
-            # raise ValueError('Heeeeeeeeeelp')
+            raise ValueError('Heeeeeeeeeelp')
             if self.k0 is None:
                 self._sparse_coding_lasso(S=S, delta=delta)
             else:
@@ -171,6 +173,7 @@ class GlobalDict:
             'augmented_multiplier_dict': None,
             'augmented_multiplier_sparse': None,
             'explained_variance': None,
+            'best_stepsize': False,
             'sparsity_level': None,
             'hard_thresh': False,
             'init_mode_dict': 'random',
@@ -181,7 +184,7 @@ class GlobalDict:
             'momentum_S': None,
             'n_atoms': None,
             'D_iters': None,
-            'S_iters': None,
+            'S_iters': 1,
             'patience': 0,
             'max_iter': 1,
             'use_CG': False,
@@ -195,6 +198,7 @@ class GlobalDict:
         self.rho_sparse = defaults['augmented_multiplier_sparse']
         self.init_mode_sparse = defaults['init_mode_sparse']
         self.init_mode_dict = defaults['init_mode_dict']
+        self.best_stepsize = defaults['best_stepsize']
         self.ev = defaults['explained_variance']
         self.dict_type = defaults['dict_type']
         self.k0 = defaults['sparsity_level']
@@ -231,8 +235,9 @@ class GlobalDict:
             if (self.n_atoms is None) or (self.dict_type == 'local_pca')
             else self.n_atoms
         )
-        self.rho_sparse *= self.n_examples
-        self.rho_dict *= self.n_examples
+        if self.dict_type == 'learnable':
+            self.rho_sparse *= self.n_examples
+            self.rho_dict *= self.n_examples
         self.D: np.ndarray = None
         self.localS: list[np.ndarray] = None
         self.localD: list[np.ndarray] = []
@@ -263,6 +268,11 @@ class GlobalDict:
     def _init_dictionary(self) -> None:
         if self.init_mode_dict == 'random':
             self.D = np.random.randn(self.stalk_dim, self.n_atoms)
+        elif self.init_mode_dict == 'fourier':
+            assert self.n_atoms == self.stalk_dim, (
+                'When using Fourier dictionary init, n_atoms must be equal to stalk_dim.'
+            )
+            self.D = dft(self.stalk_dim, scale='sqrtn').real
         else:
             raise ValueError(
                 f"Unknown initialization mode '{self.init_mode_dict}'."
@@ -347,16 +357,18 @@ class GlobalDict:
             self.run.log({'Norm. tot. loss': norm_loss}, step=self.global_step)
             self.run.log({'Reconstruction error': mse}, step=self.global_step)
             self.global_step += 1
+            print(f'Total step: {self.global_step}')
+            print(f'{self.stop_cond=}')
         return None
 
     def compute_stepsize(
         self,
         varname: str,
-        splitted: bool = False,
+        splitted: bool = True,
     ) -> None:
         if varname == 'D':
             self.Dstep = (
-                self.S @ self.S.T + self.rho_sparse * np.eye(self.S.shape)
+                1.0 / np.linalg.norm(self.S, 2) ** 2 + self.rho_sparse
                 if splitted
                 else self.Dstep
             )
@@ -383,19 +395,16 @@ class GlobalDict:
                 S_i = self.local_vars(varname='S', agent_idx=i) if gd else None
                 D_i, S_i = coder.fit(S=S_i, delta=delta, out='numpy')
                 delta = coder.delta if gd else 0
+                self.localS.append(S_i)
                 if self.D is None:
                     self.localD.append(D_i)
                 else:
                     self.S[
                         :, i * self.n_examples : (i + 1) * self.n_examples
                     ] = S_i
-                self.localS.append(S_i)
-            if self.D is not None:
-                self.eval()
+                    self.eval()
             if self.stop_cond >= self.patience:
                 break
-            else:
-                self.stop_cond = 0
         return None
 
     def _splitted_sparse_coding(self) -> None:
@@ -444,8 +453,6 @@ class GlobalDict:
                 self.eval(dict_update=True)
                 if self.stop_cond >= self.patience:
                     break
-                else:
-                    self.stop_cond = 0
         return None
 
     def cg_D_update(
@@ -472,6 +479,8 @@ class GlobalDict:
             self.R += self.D - self.P
             self.eval(splitted=splitted_reg, dict_update=True)
         else:
+            if self.best_stepsize:
+                self.compute_stepsize(varname='D', splitted=True)
             for _ in range(self.D_iters):
                 if self.use_CG:
                     self.cg_D_update()
@@ -485,8 +494,6 @@ class GlobalDict:
                 self.eval(splitted=splitted_reg, dict_update=True)
                 if self.stop_cond >= self.patience:
                     break
-                else:
-                    self.stop_cond = 0
         return None
 
     @convert_output
@@ -496,6 +503,7 @@ class GlobalDict:
             min_{D,S_i}  0.5 * ||X - D @ S||_F^2  +  lambda * sum_i ||S_i^T||_{2,1}
         """
 
+        good_iters = 0
         coder_params = {
             'explained_variance': self.ev,
             'momentum': self.momentum_S,
@@ -517,6 +525,7 @@ class GlobalDict:
                 self.U = np.zeros_like(self.S)
 
             for i in range(self.max_iter):
+                print(f'Global iteration {i + 1}/{self.max_iter}')
                 # =============================================================
                 #                    UPDATE GLOBAL DICTIONARY
                 # =============================================================
@@ -541,6 +550,9 @@ class GlobalDict:
                     )
                     break
                 else:
+                    good_iters += 1
+
+                if good_iters >= 20:
                     self.stop_cond = 0
 
             self.row_sparsity_heatmap()
@@ -590,12 +602,14 @@ class GlobalDict:
 
         metrics = {'agent_id': [], 'sparsity': [], 'nmse': []}
         for i in range(self.n_nodes):
-            S_i = self.local_vars(varname='S', agent_idx=i)
+            # S_i = self.local_vars(varname='S', agent_idx=i)
             X_i = self.local_vars(varname='X', agent_idx=i)
+            S_i = self.localS[i]
+            D_i = self.localD[i] if self.dict_type == 'local_pca' else self.D
             metrics['agent_id'].append(i)
             metrics['sparsity'].append(n_atoms(torch.from_numpy(S_i)))
             metrics['nmse'].append(
-                (norm(X_i - self.D @ S_i) ** 2 / 2) / self.n_examples
+                (norm(X_i - D_i @ S_i) ** 2 / 2) / self.n_examples
             )
 
         return metrics

@@ -38,6 +38,7 @@ class EdgeProblem:
         self.Z_ij = self.edge.get_mask(out='numpy')
         self.D_i, self.D_j = self.edge.get_dictionaries(out='numpy')
         self.N = self.X_i.shape[1]
+        self.d = self.D_i.shape[0]
 
         # ================================================================
         #                          Parameters
@@ -58,7 +59,7 @@ class EdgeProblem:
         self.alpha = defaults['lagrange_multiplier']
         self.lambda_ = defaults['mask_regularizer']
         self.beta = defaults['align_comm_tradeoff']
-        self.ev = defaults['explained_variance']
+        # self.ev = defaults['explained_variance']
         self.mu = defaults['proximal_stepsize']
         self.n_iters = defaults['n_iters']
         self.run = run
@@ -70,6 +71,7 @@ class EdgeProblem:
     def _semantic_misalignment(
         self,
         sub_projection: bool = True,
+        normalize: bool = True,
     ):
         if sub_projection:
             sm = norm(
@@ -77,6 +79,9 @@ class EdgeProblem:
             )
         else:
             sm = norm(self.F_j @ self.X_j - self.X_i, ord='fro')
+
+        if normalize:
+            sm /= norm(self.D_i @ self.S_i, ord='fro')
         return sm
 
     def _sparse_reconstructions(self):
@@ -98,7 +103,7 @@ class EdgeProblem:
         self.edge.update_restriction_maps(self.F_i, self.F_j)
         self.edge.update_sparse_representations(self.S_i, self.S_j)
         self.edge.update_mask(self.Z_ij)
-        self.edge.update_loss(self.loss)
+        self.edge.update_alignment_loss(self.loss)
 
     # ================================================================
     #                      Alignment Evaluation

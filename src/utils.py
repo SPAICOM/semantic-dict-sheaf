@@ -38,6 +38,7 @@ from functools import wraps
 from numpy.linalg import svd, norm
 import matplotlib.pyplot as plt
 from sklearn.manifold import MDS
+from sklearn.cluster import KMeans
 from pytorch_lightning import seed_everything
 
 # ================================================================
@@ -396,7 +397,7 @@ def n_atoms(S: torch.Tensor, threshold: float = 1e-5) -> int:
         int: The number of rows with non-zero norm.
     """
     row_norms = torch.norm(S, p=2, dim=1)
-    print(f'Sparsity: {int(torch.sum(row_norms > threshold).item())}')
+    # print(f'Sparsity: {int(torch.sum(row_norms > threshold).item())}')
     return int(torch.sum(row_norms > threshold).item())
 
 
@@ -572,6 +573,37 @@ def convert_output(fn):
             return _convert(result)
 
     return wrapper
+
+
+@convert_output
+def create_proto(
+    X: torch.Tensor,
+    n_proto: int,
+    seed: int = 42,
+):
+    """
+    Create prototypes using k-means clustering.
+
+    Args:
+        X : torch.Tensor
+            Input data tensor of shape (d, n), where d is the feature dimension
+            and n is the number of samples.
+        n_prototypes : int
+            The number of prototypes (clusters) to create.
+        seed : int
+            Random seed for reproducibility.
+
+    Returns:
+        torch.Tensor
+            A tensor of shape (d, n_prototypes) containing the cluster centroids.
+    """
+
+    X_np = X.T.cpu().numpy()
+    kmeans = KMeans(n_clusters=n_proto, random_state=seed)
+    kmeans.fit(X_np)
+    centroids = torch.from_numpy(kmeans.cluster_centers_.T).to(X.device)
+
+    return centroids
 
 
 def convert_input(
