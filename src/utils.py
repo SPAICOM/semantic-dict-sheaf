@@ -516,6 +516,65 @@ def layout_embedding(
     return layout, features
 
 
+def cross_cosine_similarity(A, B, k):
+    """
+    Compute the cosine similarity between the first k column vectors of two matrices.
+
+    Parameters
+    ----------
+    A : array-like of shape (n_rows, n_cols_A)
+        First matrix.
+    B : array-like of shape (n_rows, n_cols_B)
+        Second matrix. Must have the same number of rows as A.
+    k : int
+        Number of leading columns to keep from each matrix.
+
+    Returns
+    -------
+    S : np.ndarray of shape (k, k)
+        Matrix of cosine similarities where S[i, j] is the cosine similarity
+        between column i of A and column j of B (after truncation).
+
+    Notes
+    -----
+    - If a column is the all-zeros vector, its similarities are set to 0 to avoid
+      division-by-zero issues.
+    """
+    A = np.asarray(A, dtype=float)
+    B = np.asarray(B, dtype=float)
+
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError('A and B must be 2D arrays.')
+    if A.shape[0] != B.shape[0]:
+        raise ValueError('A and B must have the same number of rows.')
+    if not isinstance(k, int | np.integer) or k <= 0:
+        raise ValueError('k must be a positive integer.')
+    if k > A.shape[1] or k > B.shape[1]:
+        raise ValueError(
+            f'k={k} exceeds the number of columns in A ({A.shape[1]}) or B ({B.shape[1]}).'
+        )
+
+    Ak = A[:, :k]  # keep all rows, first k columns
+    Bk = B[:, :k]
+
+    # Column norms
+    nA = np.linalg.norm(Ak, axis=0)
+    nB = np.linalg.norm(Bk, axis=0)
+
+    # Normalize safely (avoid divide-by-zero)
+    Ak_unit = Ak / np.where(nA == 0, 1, nA)
+    Bk_unit = Bk / np.where(nB == 0, 1, nB)
+
+    # Cosine similarities = dot of unit vectors
+    S = Ak_unit.T @ Bk_unit
+
+    # If any column was zero, set corresponding similarities to 0
+    zero_mask = (nA == 0)[:, None] | (nB == 0)[None, :]
+    S[zero_mask] = 0.0
+
+    return S
+
+
 def convert_output(fn):
     @wraps(fn)
     def wrapper(self, *args, out: str = 'torch', **kwargs):

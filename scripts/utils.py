@@ -6,6 +6,7 @@ sys.path.append(str(Path(sys.path[0]).parent))
 
 from src.sheaf import Network
 from collections.abc import Callable
+import polars as pl
 import pickle
 
 
@@ -72,3 +73,52 @@ def save(func: Callable) -> Callable:
         return result
 
     return wrapper
+
+
+def save_metrics(
+    cfg,
+    metrics_type: str,
+    metrics: dict,
+    dict_type: str,
+    res_path: Path,
+) -> None:
+    """Saves the metrics dictionary to a pickle file."""
+
+    if dict_type == 'local_pca':
+        metrics['explained_variance'] = cfg.coder.explained_variance
+        metrics['seed'] = cfg.seed
+        metrics['dict_type'] = dict_type
+        metrics['simulation'] = cfg.simulation
+    elif dict_type == 'learnable':
+        metrics['seed'] = cfg.seed
+        metrics['lambda'] = cfg.coder.regularizer
+        metrics['dict_type'] = dict_type
+        metrics['simulation'] = cfg.simulation
+        metrics['augmented_multiplier_dict'] = (
+            cfg.coder.augmented_multiplier_dict
+        )
+        metrics['augmented_multiplier_sparse'] = (
+            cfg.coder.augmented_multiplier_sparse
+        )
+    else:
+        raise ValueError(f"Unknown dictionary type '{dict_type}'.")
+    filename = (
+        (
+            f'{metrics_type}_metrics_{cfg.simulation}_'
+            + f'{cfg.coder.regularizer}_'
+            + f'{cfg.coder.dict_type}_'
+            + f'{cfg.coder.augmented_multiplier_dict}_'
+            + f'{cfg.coder.augmented_multiplier_sparse}_'
+            + f'sampling_strategy_{cfg.coder.subsampling_strategy}_'
+            + f'{cfg.seed}.parquet'
+        )
+        if dict_type == 'learnable'
+        else (
+            f'{metrics_type}_metrics_{cfg.simulation}_'
+            + f'{cfg.coder.explained_variance}_'
+            + f'{cfg.coder.dict_type}_'
+            + f'{cfg.seed}.parquet'
+        )
+    )
+    df = pl.DataFrame(metrics)
+    df.write_parquet(res_path / filename)

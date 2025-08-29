@@ -7,12 +7,15 @@ sys.path.append(str(Path(sys.path[0]).parent))
 
 from torch.utils.data import TensorDataset, DataLoader
 from pytorch_lightning import Trainer
-from typing import Any
 from sklearn.cluster import KMeans
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib import cm, colors as mcolors
 import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.sparse import csgraph
 from tqdm.auto import tqdm
-from matplotlib import cm
 import jax.numpy as jnp
+from typing import Any
 import igraph as ig
 import numpy as np
 import torch
@@ -21,10 +24,10 @@ import torch
 # import matplotlib.patches as mpatches
 
 # from matplotlib.colors import Normalize
-from scipy.sparse import csgraph
 from wandb import Image
 
 from src.utils import (
+    cross_cosine_similarity,
     layout_embedding,
     save_sheaf_plt,
     random_stiefel,
@@ -726,20 +729,32 @@ class Network:
         Report edge-level metrics for alignment and task performance comparison.
         """
 
-        metrics = {
-            'edge_id': [],
-            'sparsity_pattern_similarity': [],
-            'alignment_loss': [],
-            'task_accuracy': [],
-            'task_loss': [],
-            'task_accuracy_rev': [],
-            'task_loss_rev': [],
-        }
+        metrics = (
+            {
+                'edge_id': [],
+                'sparsity_pattern_similarity': [],
+                'alignment_loss': [],
+                'task_accuracy': [],
+                'task_loss': [],
+                'task_accuracy_rev': [],
+                'task_loss_rev': [],
+            }
+            if self.coder_params['dict_type'] == 'learnable'
+            else {
+                'edge_id': [],
+                'alignment_loss': [],
+                'task_accuracy': [],
+                'task_loss': [],
+                'task_accuracy_rev': [],
+                'task_loss_rev': [],
+            }
+        )
         for edge in self.edges.values():
             metrics['edge_id'].append(edge.id)
-            metrics['sparsity_pattern_similarity'].append(
-                edge.evaluate_sparsity_pattern_similarity()
-            )  # TODO
+            if self.coder_params['dict_type'] == 'learnable':
+                metrics['sparsity_pattern_similarity'].append(
+                    edge.evaluate_sparsity_pattern_similarity()
+                )
             metrics['alignment_loss'].append(edge.return_alignment_loss())
             accs = edge.return_task_accs()
             losses = edge.return_task_losses()
@@ -754,19 +769,28 @@ class Network:
         """Compute the dictionary metrics for each agent.
         Report agent-level metrics for sparse coding and task performance comparison.
         """
+        if 'acc' not in self.dict_metrics:
+            metrics = {
+                'agent_id': self.dict_metrics['agent_id'],
+                'sparsity': self.dict_metrics['sparsity'],
+                'nmse': self.dict_metrics['nmse'],
+                'acc': [],
+            }
+            for agent in self.agents.values():
+                metrics['acc'].append(agent.acc)
+            self.dict_metrics = metrics
         return self.dict_metrics
 
     @save_sheaf_plt
     def sheaf_plot(
         self,
-        layout: list[tuple[int]] = None,
+        layout: str = None,
         with_labels: bool = True,
-        n_clusters: int = 2,
+        n_clusters: int = None,
         seed: int = 42,
     ) -> None:
-        """Plot the sheaf with spectral clustering and custom aesthetics using igraph."""
-
-        # Edge weights and labels
+        """Plot the sheaf with a slim right colorbar, node numbers inside nodes, and a table below."""
+        # --- Edge weights & labels
         edge_losses = self.get_edge_losses()
         weights = [
             edge_losses[tuple(sorted([e.source, e.target]))]
@@ -775,89 +799,198 @@ class Network:
         self.graph.es['weight'] = weights
         self.graph.es['label'] = [f'{w:.2f}' for w in weights]
 
-        # Layout
-        layout, _ = layout_embedding(
-            graph=self.graph, layout=layout, seed=seed
-        )
+        # --- Layout
+        if layout is None:
+            layout, _ = layout_embedding(
+                graph=self.graph, layout=layout, seed=seed
+            )
+        else:
+            layout = self.graph.layout(layout)
 
-        # Spectral clustering using graph Laplacian
-        n = len(self.graph.vs)
-        A = np.zeros((n, n))
-        for e in self.graph.es:
-            A[e.source, e.target] = A[e.target, e.source] = e['weight']
+        # --- Optional spectral clustering
+        if n_clusters is None:
+            mark_groups = None
+        else:
+            n = len(self.graph.vs)
+            A = np.zeros((n, n), dtype=float)
+            for e in self.graph.es:
+                A[e.source, e.target] = A[e.target, e.source] = e['weight']
+            L = csgraph.laplacian(A, normed=False)
+            _, eigvecs = np.linalg.eigh(L)
+            X = eigvecs[:, 1 : n_clusters + 1]
+            kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(X)
+            cluster_labels = kmeans.labels_.tolist()
+            self.graph.vs['cluster'] = cluster_labels
+            mark_groups = [[] for _ in range(n_clusters)]
+            for idx, label in enumerate(cluster_labels):
+                mark_groups[label].append(idx)
 
-        L = csgraph.laplacian(A, normed=False)
-        _, eigvecs = np.linalg.eigh(L)
-        X = eigvecs[:, 1 : n_clusters + 1]
-        kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(X)
-        cluster_labels = kmeans.labels_.tolist()  # Convert to Python list
-        self.graph.vs['cluster'] = cluster_labels
-
-        # Node color based on accuracy, mapped to [0.5, 1.0] in RdYlGn colormap
-        accs = np.array([agent.acc for agent in self.agents.values()])
-        acc_norm = (accs - accs.min()) / (np.ptp(accs) + 1e-6)
-        acc_scaled = 0.5 + acc_norm * 0.5
+        # --- Node colors from accuracy [0,1] using RdYlGn
+        agents_list = list(
+            self.agents.values()
+        )  # assumed aligned with vertex order
+        accs = np.array([float(a.acc) for a in agents_list], dtype=float)
+        accs = np.clip(accs, 0.0, 1.0)
         cmap = cm.get_cmap('RdYlGn')
-        self.graph.vs['color'] = [cmap(a) for a in acc_scaled]
+        acc_norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+        self.graph.vs['color'] = [tuple(cmap(acc_norm(a))) for a in accs]
 
-        # Node size based on sparsity
-        min_size = 10
-        max_size = 40
+        # --- Node sizes: sparsity → larger range so numbers fit inside nodes
         sparsities = np.array(
-            [agent.sparsity for agent in self.agents.values()]
+            [float(a.sparsity) for a in agents_list], dtype=float
         )
-        sparsity_min = sparsities.min()
-        sparsity_max = sparsities.max()
-        sparsity_range = sparsity_max - sparsity_min + 1e-6
-        normalized_sizes = min_size + (
-            (sparsities - sparsity_min) / sparsity_range
-        ) * (max_size - min_size)
-        self.graph.vs['size'] = normalized_sizes.tolist()
+        sp_min, sp_max = np.min(sparsities), np.max(sparsities)
+        denom = (sp_max - sp_min) if (sp_max - sp_min) > 0 else 1.0
+        min_size, max_size = 26.0, 72.0  # enlarged range
+        self.graph.vs['size'] = (
+            min_size + ((sparsities - sp_min) / denom) * (max_size - min_size)
+        ).tolist()
 
-        # Edge color in greyscale (to fake alpha fading)
-        norm_weights = (np.array(weights) - min(weights)) / (
-            max(weights) - min(weights) + 1e-5
-        )
+        # --- Edge colors: lighter for weaker edges
+        w = np.asarray(weights, dtype=float)
+        norm_w = (w - w.min()) / (w.max() - w.min() + 1e-12)
         greys = cm.get_cmap('Greys')
-        self.graph.es['color'] = [
-            greys(0.3 + 0.7 * (1 / w + 1e-6)) for w in norm_weights
-        ]
+        grey_vals = 0.9 - 0.6 * norm_w
+        self.graph.es['color'] = [tuple(greys(float(v))) for v in grey_vals]
 
-        # Labels
+        # --- Vertex labels: ONLY node numbers, centered; color depends on accuracy
         if with_labels:
             self.graph.vs['label'] = [
-                f'{agent.id}: {agent.model_name}\nAcc: {agent.acc:.2f} - N. Atoms: {agent.sparsity}'
-                for agent in self.agents.values()
+                str(i) for i in range(len(self.graph.vs))
             ]
+            # White text except when 0.3 <= acc <= 0.7 -> black (for yellow-ish nodes)
+            label_colors = [
+                'black' if 0.3 <= float(a) <= 0.7 else 'white' for a in accs
+            ]
+            self.graph.vs['label_color'] = label_colors  # per-vertex attribute
+            self.graph.vs['label_size'] = 14  # font size of numbers
+            self.graph.vs['label_dist'] = 0  # center inside nodes
         else:
             self.graph.vs['label'] = None
 
-        # Clustering groups for `mark_groups`
-        mark_groups = [[] for _ in range(n_clusters)]
-        for idx, label in enumerate(cluster_labels):
-            mark_groups[label].append(idx)
+        # --- Figure: graph on top, table below
+        fig = plt.figure(figsize=(16, 11))
+        gs = fig.add_gridspec(
+            nrows=2, ncols=1, height_ratios=[0.78, 0.22], hspace=0.10
+        )
+        ax_graph = fig.add_subplot(gs[0, 0])
+        ax_table = fig.add_subplot(gs[1, 0])
 
-        # Plotting
-        _, ax = plt.subplots(figsize=(20, 20))
-        plt.title(f"Sheaf learned with '{self.run.name}' algorithm")
-
+        # --- Draw graph (no titles)
         ig.plot(
             self.graph,
-            target=ax,
+            target=ax_graph,
             layout=layout,
             vertex_color=self.graph.vs['color'],
             vertex_size=self.graph.vs['size'],
             vertex_label=self.graph.vs['label'],
+            # DO NOT pass vertex_label_color here — use per-vertex attribute set above
             edge_color=self.graph.es['color'],
             edge_label=self.graph.es['label'],
-            # mark_groups=mark_groups,
-            # mark_color=[(0.8, 0.8, 0.8, 0.2)] * n_clusters,
+            mark_groups=mark_groups,
             bbox=(300, 300),
             margin=40,
         )
+
+        # --- Slim vertical colorbar on the RIGHT of the graph
+        sm = cm.ScalarMappable(norm=acc_norm, cmap=cmap)
+        sm.set_array([])
+        divider = make_axes_locatable(ax_graph)
+        cax = divider.append_axes(
+            'right', size='0.6%', pad=0.02
+        )  # small & tidy
+        cbar = fig.colorbar(sm, cax=cax, orientation='vertical')
+        cbar.set_label('Avg. Accuracy', fontsize=13, rotation=90, labelpad=10)
+        cbar.set_ticks([0.0, 0.5, 1.0])
+        cbar.ax.tick_params(labelsize=12, length=3)  # larger tick numbers
+        cbar.outline.set_visible(False)
+
+        # Hide graph ticks
+        ax_graph.tick_params(
+            left=False, bottom=False, labelleft=False, labelbottom=False
+        )
+
+        # --- Table below the graph
+        ax_table.axis('off')
+        rows = [
+            [i, a.model_name, int(sparsities[i]), f'{accs[i]:.2f}']
+            for i, a in enumerate(agents_list)
+        ]
+        table = ax_table.table(
+            cellText=rows,
+            colLabels=['Node', 'Model', 'Dimension', 'Accuracy'],
+            cellLoc='center',
+            colLoc='center',
+            loc='center',
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1.05, 1.18)
+
         plt.tight_layout()
-        self.run.log({'final_network': Image(plt)})
-        # self.run.summary['final_network'] = Image(plt)
+        self.run.log({'final_network': Image(fig)})
+        return None
+
+    def restriction_maps_heatmap(
+        self,
+        n: int,
+    ) -> None:
+        """Plot the restriction maps for the best n communication edges."""
+        cols = n // 2
+        fig, axes = plt.subplots(2, cols, figsize=(10, 5))
+
+        for ax, edge in zip(axes.flatten(), list(self.edges.values())):
+            _, F_j = edge.get_restriction_maps(out='numpy')
+
+            # Min–max normalize to [0, 1] per heatmap
+            mn = np.nanmin(F_j)
+            mx = np.nanmax(F_j)
+            if not np.isfinite(mn) or not np.isfinite(mx) or mx - mn == 0:
+                F_j = np.zeros_like(F_j, dtype=float)
+            else:
+                F_j = (F_j - mn) / (mx - mn)
+
+            sns.heatmap(
+                F_j,
+                ax=ax,
+                cmap='viridis',
+                cbar_kws={'label': 'Value'},
+            )
+            ax.set_xlabel('')
+            ax.set_ylabel('')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f'Restriction Map on Edge {edge.id}')
+
+        plt.tight_layout()
+        self.run.log({'restriction_maps': Image(plt)})
+        return None
+
+    def pca_correlation_heatmap(
+        self,
+        k: int,
+        n: int,
+    ) -> None:
+        """Plot the similarity of the first k principal components of two agents for the best k communication edges."""
+        cols = n // 2
+        fig, axes = plt.subplots(2, cols, figsize=(10, 5))
+        ax_list = axes.ravel()
+        for ax, edge in zip(ax_list, list(self.edges.values())):
+            D_i, D_j = edge.get_dictionaries(out='numpy')
+            Sim = cross_cosine_similarity(D_i, D_j, k)
+            sns.heatmap(
+                Sim,
+                ax=ax,
+                cmap='viridis',
+                cbar_kws={'label': 'Value'},
+            )
+            ax.set_xlabel('Principal Component')
+            ax.set_ylabel('Principal Component')
+            ax.set_title(f'Cross-Covariance on Edge {edge.id}')
+
+        plt.tight_layout()
+        self.run.log({'pca_correlation': Image(plt)})
+        return None
 
 
 def main():

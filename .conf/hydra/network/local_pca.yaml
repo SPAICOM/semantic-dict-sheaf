@@ -1,7 +1,7 @@
 seed: 42
 device: cpu
 simulation: local_pca
-save_results: False
+save_results: True
 
 network:
   path: toy_example
@@ -25,12 +25,24 @@ network:
 alignment:
   problem: procrustes
   verbose: true
-  n_edges: 5
-  plotting_nclusters: 3
+  n_edges: 6
 
 coder:
   dict_type: local_pca
   explained_variance: 0.9
 
+visualization:
+  plot_restriction_maps: true
+  plot_pca_correlation: true
+  nclusters: null
+  layout: kamada_kawai
+
+
 wandb:
   project: local_pca
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      coder.explained_variance: 0.5, 0.6, 0.7, 0.8, 0.9 

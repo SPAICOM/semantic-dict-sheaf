@@ -44,6 +44,9 @@ coder:
   augmented_multiplier_dict: 1
   augmented_multiplier_sparse: 1
 
+visualization:
+  plot_restriction_maps: false
+
 wandb:
   project: CF_both_both_splitted
 
