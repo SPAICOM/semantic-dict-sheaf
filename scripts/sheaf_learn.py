@@ -120,6 +120,8 @@ def main(cfg) -> None:
         net.restriction_maps_heatmap(cfg.alignment.n_edges)
     if cfg.visualization.plot_pca_correlation:
         net.pca_correlation_heatmap(20, cfg.alignment.n_edges)
+    if cfg.visualization.plot_global_dict_corr:
+        net.global_dict_corr_heatmap()
     wandb.finish()
     print('[Passed]')
 

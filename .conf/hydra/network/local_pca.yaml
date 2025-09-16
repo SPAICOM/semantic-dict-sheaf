@@ -34,6 +34,7 @@ coder:
 visualization:
   plot_restriction_maps: true
   plot_pca_correlation: true
+  plot_global_dict_corr: false
   nclusters: null
   layout: kamada_kawai
 

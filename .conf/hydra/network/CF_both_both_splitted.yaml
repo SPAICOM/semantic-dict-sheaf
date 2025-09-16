@@ -25,7 +25,7 @@ network:
 alignment:
   problem: procrustes
   verbose: true
-  n_edges: 5
+  n_edges: 6
   plotting_nclusters: 3
 
 coder:
@@ -37,7 +37,7 @@ coder:
   init_mode_sparse: fourier
   regularizer: 200
   n_atoms: null
-  max_iter: 2000
+  max_iter: 1000 # 2000
   tol: 1e-6
   patience: 30
   hard_thresh: false
@@ -45,7 +45,11 @@ coder:
   augmented_multiplier_sparse: 1
 
 visualization:
-  plot_restriction_maps: false
+  plot_restriction_maps: true
+  plot_pca_correlation: false
+  plot_global_dict_corr: true
+  nclusters: null
+  layout: kamada_kawai
 
 wandb:
   project: CF_both_both_splitted

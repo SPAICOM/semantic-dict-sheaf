@@ -424,7 +424,7 @@ class Network:
         self.dictionary = dictionary
         self.device: str = device
         self.global_dim: int = 0
-        # self.globalDict: torch.Tensor = None
+        self.globalDict: torch.Tensor = None
         self.n_agents: int = 0
         self.n_edges: int = 0
         self.run = run
@@ -522,7 +522,8 @@ class Network:
             self.agents[i].D = DD[i]
 
         self.dict_metrics = GD.return_metrics()
-
+        if self.coder_params['dict_type'] == 'learnable':
+            self.globalDict = DD[0]
         return None
 
     def _is_connection_graph(
@@ -929,6 +930,7 @@ class Network:
 
         plt.tight_layout()
         self.run.log({'final_network': Image(fig)})
+        plt.close()
         return None
 
     def restriction_maps_heatmap(
@@ -964,6 +966,7 @@ class Network:
 
         plt.tight_layout()
         self.run.log({'restriction_maps': Image(plt)})
+        plt.close()
         return None
 
     def pca_correlation_heatmap(
@@ -986,10 +989,26 @@ class Network:
             )
             ax.set_xlabel('Principal Component')
             ax.set_ylabel('Principal Component')
-            ax.set_title(f'Cross-Covariance on Edge {edge.id}')
+            ax.set_title(f'PC Cosine Similarity on Edge {edge.id}')
 
         plt.tight_layout()
         self.run.log({'pca_correlation': Image(plt)})
+        plt.close()
+        return None
+
+    def global_dict_corr_heatmap(self) -> None:
+        corr = np.corrcoef(self.globalDict.numpy(), rowvar=False)
+        plot = sns.heatmap(
+            corr,
+            cmap='viridis',
+            # cbar_kws={'label': 'Value'},
+        )
+        # plt.xlabel('Principal Component')
+        # plt.ylabel('Principal Component')
+        plt.title('Global dict atoms cross-correlation')
+        plt.tight_layout()
+        self.run.log({'global_dict_correlation': Image(plot)})
+        plt.close()
         return None
 
 
