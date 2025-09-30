@@ -10,7 +10,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from numpy.linalg import norm, inv
 from scipy.sparse.linalg import cg
-from scipy.linalg import dft
 from typing import Any
 from wandb import Image
 import matplotlib.pyplot as plt
@@ -18,7 +17,13 @@ import seaborn as sns
 import numpy as np
 import torch
 
-from src.utils import convert_output, block_thresholding, colnorm, n_atoms
+from src.utils import (
+    block_thresholding,
+    convert_output,
+    dct_matrix,
+    colnorm,
+    n_atoms,
+)
 
 
 class SparseCoder:
@@ -26,6 +31,7 @@ class SparseCoder:
         self,
         X: np.ndarray,
         D: np.ndarray = None,
+        method: str = 'lasso',
         params: dict[Any] = {},
     ):
         # ================================================================
@@ -36,6 +42,7 @@ class SparseCoder:
             'sparsity_level': None,
             'hard_thresh': False,
             'regularizer': 1e-3,
+            'method': 'lasso',
             'momentum': None,
             # 'dict_type': None,
             'n_atoms': None,
@@ -50,6 +57,7 @@ class SparseCoder:
         self.alpha = defaults['regularizer']
         self.max_iter = defaults['max_iter']
         self.momentum = defaults['momentum']
+        self.method = defaults['method']
         self.step = defaults['step']
         self.tol = defaults['tol']
 
@@ -104,7 +112,7 @@ class SparseCoder:
                 max_iter=self.max_iter,
                 tol=self.tol,
             )
-            lasso.fit(self.D.real, self.X)
+            lasso.fit(self.D, self.X)
             self.S = lasso.coef_.T
         else:
             grad = self.D.T @ (self.D @ S - self.X)
@@ -135,7 +143,7 @@ class SparseCoder:
             fit_intercept=False,
             precompute=True,
         )
-        omp.fit(Domp.real, self.X)
+        omp.fit(Domp, self.X)
         self.S = omp.coef_.T
 
         return None
@@ -146,14 +154,16 @@ class SparseCoder:
         S: np.ndarray = None,
         delta: np.ndarray = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        if self.D is None:
+        if self.method == 'pca':
             self._set_dictionary()
+        elif self.method == 'lasso':
+            self._sparse_coding_lasso(S=S, delta=delta)
+        elif self.method == 'omp':
+            self._sparse_coding_omp()
         else:
-            raise ValueError('Heeeeeeeeeelp')
-            if self.k0 is None:
-                self._sparse_coding_lasso(S=S, delta=delta)
-            else:
-                self._sparse_coding_omp()
+            raise ValueError(
+                f'{self.method} is not a valid sparse coding method'
+            )
         return self.D, self.S
 
 
@@ -173,8 +183,11 @@ class GlobalDict:
             'augmented_multiplier_dict': None,
             'augmented_multiplier_sparse': None,
             'explained_variance': None,
+            'sparsity_tolerance': 1e-3,
             'best_stepsize': False,
             'sparsity_level': None,
+            'coding_method': 'lasso',
+            'sparse_descent': False,
             'hard_thresh': False,
             'init_mode_dict': 'random',
             'init_mode_sparse': 'zeros',
@@ -198,7 +211,10 @@ class GlobalDict:
         self.rho_sparse = defaults['augmented_multiplier_sparse']
         self.init_mode_sparse = defaults['init_mode_sparse']
         self.init_mode_dict = defaults['init_mode_dict']
+        self.coding_method = defaults['coding_method']
         self.best_stepsize = defaults['best_stepsize']
+        self.descent = defaults['sparse_descent']
+        self.stol = defaults['sparsity_tolerance']
         self.ev = defaults['explained_variance']
         self.dict_type = defaults['dict_type']
         self.k0 = defaults['sparsity_level']
@@ -272,7 +288,7 @@ class GlobalDict:
             assert self.n_atoms == self.stalk_dim, (
                 'When using Fourier dictionary init, n_atoms must be equal to stalk_dim.'
             )
-            self.D = dft(self.stalk_dim, scale='sqrtn').real
+            self.D = dct_matrix(self.stalk_dim, norm='ortho')
         else:
             raise ValueError(
                 f"Unknown initialization mode '{self.init_mode_dict}'."
@@ -291,7 +307,7 @@ class GlobalDict:
                 for _ in range(self.n_nodes)
             ]
         elif self.init_mode_sparse == 'fourier':
-            self.D = dft(self.stalk_dim, scale='sqrtn').real
+            self.D = dct_matrix(self.stalk_dim, norm='ortho')
             self.S = self.D @ self.X
             self.localS = [
                 self.local_vars(varname='S', agent_idx=i)
@@ -357,8 +373,8 @@ class GlobalDict:
             self.run.log({'Norm. tot. loss': norm_loss}, step=self.global_step)
             self.run.log({'Reconstruction error': mse}, step=self.global_step)
             self.global_step += 1
-            print(f'Total step: {self.global_step}')
-            print(f'{self.stop_cond=}')
+            # print(f'Total step: {self.global_step}')
+            # print(f'{self.stop_cond=}')
         return None
 
     def compute_stepsize(
@@ -379,7 +395,6 @@ class GlobalDict:
 
     def _sparse_coding(
         self,
-        gd: bool = False,
         coder_params: dict[Any] = {},
     ) -> None:
         self.localS = []
@@ -392,19 +407,25 @@ class GlobalDict:
                     D=self.D,
                     params=coder_params,
                 )
-                S_i = self.local_vars(varname='S', agent_idx=i) if gd else None
+                S_i = (
+                    self.local_vars(varname='S', agent_idx=i)
+                    if self.descent
+                    else None
+                )
                 D_i, S_i = coder.fit(S=S_i, delta=delta, out='numpy')
-                delta = coder.delta if gd else 0
+                delta = coder.delta if self.descent else 0
                 self.localS.append(S_i)
-                if self.D is None:
+                if self.dict_type == 'local_pca':
                     self.localD.append(D_i)
-                else:
-                    self.S[
-                        :, i * self.n_examples : (i + 1) * self.n_examples
-                    ] = S_i
-                    self.eval()
+                # else:
+                #     self.S[
+                #         :, i * self.n_examples : (i + 1) * self.n_examples
+                #     ] = S_i
+                #     self.eval()
             if self.stop_cond >= self.patience:
                 break
+        self.S = np.hstack(self.localS)
+        self.eval(splitted=False)
         return None
 
     def _splitted_sparse_coding(self) -> None:
@@ -505,9 +526,11 @@ class GlobalDict:
 
         good_iters = 0
         coder_params = {
+            'method': self.coding_method,
             'explained_variance': self.ev,
             'momentum': self.momentum_S,
             'sparsity_level': self.k0,
+            'sparsity_tolerance': self.stol,
             'hard_thresh': self.thresh,
             'regularizer': self.alpha,
             'max_iter': self.max_iter,
@@ -525,7 +548,7 @@ class GlobalDict:
                 self.U = np.zeros_like(self.S)
 
             for i in range(self.max_iter):
-                print(f'Global iteration {i + 1}/{self.max_iter}')
+                # print(f'Global iteration {i + 1}/{self.max_iter}')
                 # =============================================================
                 #                    UPDATE GLOBAL DICTIONARY
                 # =============================================================
@@ -539,7 +562,7 @@ class GlobalDict:
                 if self.split in ['both', 'sparse']:
                     self._splitted_sparse_coding()
                 else:
-                    self._sparse_coding(gd=True, coder_params=coder_params)
+                    self._sparse_coding(coder_params=coder_params)
 
                 # =============================================================
                 #                  EARLY STOPPING CRITERION
@@ -582,13 +605,14 @@ class GlobalDict:
         #             self.stop_cond = 0
 
         elif self.dict_type == 'fourier':
-            self.D = dft(self.stalk_dim, scale='sqrtn')
+            self.D = dct_matrix(self.stalk_dim, norm='sqrtn')
         elif self.dict_type == 'local_pca':
             assert self.S_iters == 1, (
                 'S_iters must be 1 for local PCA dictionary.'
             )
             self.D = None
-            self._sparse_coding(gd=False, coder_params=coder_params)
+            coder_params['method'] = 'pca'
+            self._sparse_coding(coder_params=coder_params)
         else:
             raise ValueError(f"Unknown dictionary type '{self.dict_type}'.")
 

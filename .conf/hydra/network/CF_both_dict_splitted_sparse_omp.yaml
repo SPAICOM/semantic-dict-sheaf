@@ -46,9 +46,6 @@ network:
       - cifar10
       - 42
 
-
-
-
 alignment:
   problem: procrustes
   verbose: true
@@ -58,11 +55,14 @@ alignment:
 coder:
   n_subsampling: 4000
   subsampling_strategy: proto
-  split: both
+  split: dict
   dict_type: learnable
+  coding_method: omp
+  sparse_descent: False
   init_mode_dict: fourier
   init_mode_sparse: fourier
-  regularizer: 200
+  sparsity_tolerance: 1e-3
+  regularizer: 50
   n_atoms: null
   max_iter: 1000 # 2000
   tol: 1e-6
@@ -79,7 +79,7 @@ visualization:
   layout: kamada_kawai
 
 wandb:
-  project: CF_both_both_splitted
+  project: CF_both_dict_splitted_sparse_omp
 
 hydra:
   mode: MULTIRUN

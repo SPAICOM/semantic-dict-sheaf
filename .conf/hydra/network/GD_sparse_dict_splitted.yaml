@@ -36,6 +36,7 @@ coder:
   dict_type: learnable
   init_mode_dict: random
   init_mode_sparse: random
+  sparse_descent: False
   regularizer: 1e-4
   n_atoms: 800
   max_iter: 200

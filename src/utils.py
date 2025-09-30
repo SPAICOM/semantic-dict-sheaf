@@ -34,6 +34,7 @@ import numpy as np
 from typing import Any
 import jax.numpy as jnp
 from pathlib import Path
+from scipy.fft import dct
 from functools import wraps
 from numpy.linalg import svd, norm
 import matplotlib.pyplot as plt
@@ -573,6 +574,11 @@ def cross_cosine_similarity(A, B, k):
     S[zero_mask] = 0.0
 
     return S
+
+
+def dct_matrix(N, norm='ortho'):
+    dct_dict = dct(np.eye(N), type=2, norm=norm, axis=0)
+    return dct_dict
 
 
 def convert_output(fn):
