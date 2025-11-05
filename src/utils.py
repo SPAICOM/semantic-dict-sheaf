@@ -31,16 +31,18 @@ import math
 import torch
 import shutil
 import numpy as np
+import seaborn as sns
 from typing import Any
 import jax.numpy as jnp
 from pathlib import Path
 from scipy.fft import dct
 from functools import wraps
-from numpy.linalg import svd, norm
 import matplotlib.pyplot as plt
 from sklearn.manifold import MDS
 from sklearn.cluster import KMeans
-from pytorch_lightning import seed_everything
+from numpy.linalg import svd, norm
+from scipy.optimize import root_scalar
+# from pytorch_lightning import seed_everything
 
 # ================================================================
 #
@@ -379,8 +381,8 @@ def random_stiefel(
         Q : torch.Tensor, shape (n, p)
             A semi‐orthogonal matrix with Q.T @ Q == I_p.
     """
-    seed_everything(seed)
-    A = np.random.randn(n, p)
+    rng = np.random.default_rng(seed)
+    A = rng.standard_normal((n, p))
     U, _, Vt = svd(A, full_matrices=False)
     res = U @ Vt
     return torch.from_numpy(res.astype(np.float32))
@@ -576,9 +578,41 @@ def cross_cosine_similarity(A, B, k):
     return S
 
 
+def corr_heatmap(matrix: np.ndarray):
+    corr = np.corrcoef(matrix, rowvar=False)
+    plot = sns.heatmap(
+        corr,
+        cmap='viridis',
+    )
+    return plot
+
+
 def dct_matrix(N, norm='ortho'):
     dct_dict = dct(np.eye(N), type=2, norm=norm, axis=0)
     return dct_dict
+
+
+def proximal_logdet(
+    evals: np.ndarray, epsilon: float, lam: float
+) -> np.ndarray:
+    def f(s, sigma, lam, epsilon):
+        return s - sigma - (2 * lam * s) / (s**2 + epsilon)
+
+    def df(s, sigma, lam, epsilon):
+        return 1 - (2 * lam * epsilon) / (s**2 + epsilon) ** 2
+
+    constrained_evals = []
+    for sigma in evals:
+        sol = root_scalar(
+            f,
+            fprime=df,
+            args=(sigma, lam, epsilon),
+            method='newton',
+            x0=sigma,
+        )
+        constrained_evals.append(sol.root)
+
+    return np.array(constrained_evals)
 
 
 def convert_output(fn):
@@ -697,12 +731,14 @@ def save_sheaf_plt(fn):
         path = os.path.join(os.getcwd(), 'plot')
         if not os.path.exists(path):
             os.makedirs(path)
+        threshold = kwargs.get('threshold')
         save_path = os.path.join(
             path,
-            f'{self.run.name}_{self.n_edges}_edges_{self.n_agents}_nodes.png',
+            f'{self.run.name}_{self.n_edges}_edges_{self.n_agents}_nodes_{threshold}_threshold.pdf',
         )
         plt.savefig(save_path)
         print(f'Graph plot saved to {save_path}')
+        plt.close()
         return None
 
     return wrapper

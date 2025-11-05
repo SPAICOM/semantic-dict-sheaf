@@ -8,6 +8,14 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
+try:
+    base_dir = Path(__file__).parent.parent
+except NameError:
+    base_dir = Path.cwd()
+
+style_path = base_dir / '.conf' / 'plotting' / 'plt.mplstyle'
+plt.style.use(style_path.resolve())
+
 
 def read_files(setup: str, study: str) -> pl.DataFrame:
     folder = (
@@ -36,11 +44,11 @@ def read_files(setup: str, study: str) -> pl.DataFrame:
     for col, dtype_map in col_dtype_files.items():
         if len(dtype_map) > 1:
             has_conflicts = True
-            print(f'\nColumn: {col}')
-            for dtype, fnames in dtype_map.items():
-                print(f'  {dtype}:')
-                for n in fnames:
-                    print(f'    - {n}')
+            # print(f'\nColumn: {col}')
+            # for dtype, fnames in dtype_map.items():
+            #     print(f'  {dtype}:')
+            #     for n in fnames:
+            #         print(f'    - {n}')
 
     if not has_conflicts:
         print('No dtype conflicts found across files.')
@@ -48,6 +56,7 @@ def read_files(setup: str, study: str) -> pl.DataFrame:
     for file in folder.glob(f'{study}_metrics_{setup}_*.parquet'):
         match = pattern.search(file.stem)
         if match:
+            print(file)
             df = pl.read_parquet(file)
             print(df.columns)
             if 'lambda' in df.columns:
@@ -61,7 +70,7 @@ def read_files(setup: str, study: str) -> pl.DataFrame:
     else:
         print(f'No files found matching the pattern in {folder}.')
 
-    print(final_df.columns)
+    # print(final_df.columns)
     return final_df
 
 
@@ -73,62 +82,97 @@ def dict_learning_plot(
 
     if setup != 'local_pca':
         pdf['lambda'] = pd.to_numeric(pdf['lambda'], errors='ignore')
-        label = 'Regularizer'
+        label = r'Sparse Regularizer $\lambda$'
         property = 'lambda'
         metric = 'nmse'
         metric_label = 'NMSE'
-        sparsity_label = 'Sparsity'
+        second_label = 'Avg. Accuracy'
+        second_metric = 'acc'
         hue = None
     else:
         label = 'Explained Variance'
         property = 'explained_variance'
         metric = 'acc'
         metric_label = 'Avg. Accuracy'
-        sparsity_label = 'Dimensionality'
+        second_label = 'Dimensionality'
+        second_metric = 'sparsity'
         hue = 'agent_id'
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=False)
+    # three plots side by side
+    fig, axes = plt.subplots(1, 3, figsize=(30, 10), sharex=False)
 
-    # metric vs property
+    # === 1. metric vs property ===
     sns.lineplot(
         data=pdf,
         x=property,
         y=metric,
         hue=hue,
-        linewidth=2,
         style=hue,
         markers=True,
-        markersize=8,
         ax=axes[0],
     )
-    # axes[0].set_title(f'{metric_label} vs {label}')
-    axes[0].set_xlabel(f'{label}')
-    axes[0].set_ylabel(f'{metric_label}')
+    axes[0].set_xlabel(label)
+    axes[0].set_ylabel(metric_label)
     axes[0].grid(True, axis='y')
     if setup != 'local_pca':
         axes[0].set_xscale('log')
     else:
-        axes[0].legend(title='Agent', loc='best')
+        sns.move_legend(axes[0], 'best', title='Agent', frameon=True)
 
-    # Sparsity vs property, colored by agent
+    # === 2. second_metric vs property ===
+    sns.lineplot(
+        data=pdf,
+        x=property,
+        y=second_metric,
+        hue='agent_id' if 'agent_id' in pdf.columns else None,
+        style='agent_id' if 'agent_id' in pdf.columns else None,
+        markers=True,
+        ax=axes[1],
+        legend='full',
+    )
+    # handles, labels = axes[1].get_legend_handles_labels()
+
+    # # Keep first occurrence (preserves color)
+    # by_label = {}
+    # for h, l in zip(handles, labels):
+    #     if l not in by_label:
+    #         by_label[l] = h
+
+    # axes[1].legend(by_label.values(), by_label.keys(), title='Agent')
+    axes[1].set_xlabel(label)
+    axes[1].set_ylabel(second_label)
+    axes[1].grid(True, axis='y')
+    if setup != 'local_pca':
+        axes[1].set_xscale('log')
+
+    # === 3. sparsity vs property ===
     sns.lineplot(
         data=pdf,
         x=property,
         y='sparsity',
-        linewidth=2,
-        style='agent_id',
+        hue='agent_id' if 'agent_id' in pdf.columns else None,
+        style='agent_id' if 'agent_id' in pdf.columns else None,
         markers=True,
-        markersize=8,
-        hue='agent_id',
-        ax=axes[1],
+        ax=axes[2],
+        legend=False,
     )
-    # axes[1].set_title(f'{sparsity_label} vs {label}')
-    axes[1].set_xlabel(f'{label}')
-    axes[1].set_ylabel(f'{sparsity_label}')
-    axes[1].grid(True, axis='y')
-    axes[1].legend(title='Agent', loc='best')
+    axes[2].set_xlabel(label)
+    axes[2].set_ylabel('Non-zero coefficients')
+    axes[2].grid(True, axis='y')
     if setup != 'local_pca':
-        axes[1].set_xscale('log')
+        axes[2].set_xscale('log')
+
+    # === unified legend (only if agent_id exists and we got handles) ===
+    if 'agent_id' in pdf.columns:
+        handles, labels = axes[2].get_legend_handles_labels()
+        if handles and labels:
+            fig.legend(
+                handles,
+                labels,
+                title='Agent',
+                loc='upper center',
+                ncol=len(labels),
+            )
 
     plots_dir = (
         Path.cwd().parent / 'plot'
@@ -136,10 +180,10 @@ def dict_learning_plot(
         else Path.cwd() / 'plot'
     )
     plots_dir.mkdir(parents=True, exist_ok=True)
-    out_path = plots_dir / f'{label.lower()}_plots.png'
+    out_path = plots_dir / 'regularizer_plots.pdf'
 
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=300)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path)
     plt.close(fig)
 
     print(f'Saved figure to: {out_path}')

@@ -38,6 +38,7 @@ class EdgeProblem:
         self.Z_ij = self.edge.get_mask(out='numpy')
         self.D_i, self.D_j = self.edge.get_dictionaries(out='numpy')
         self.N = self.X_i.shape[1]
+        # self.N = self.S_i.shape[1]
         self.d = self.D_i.shape[0]
 
         # ================================================================

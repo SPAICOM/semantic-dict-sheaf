@@ -1,13 +1,13 @@
-import sys
-from pathlib import Path
 import os
+import sys
+import pickle
+import polars as pl
+from pathlib import Path
+from collections.abc import Callable
 
 sys.path.append(str(Path(sys.path[0]).parent))
 
 from src.sheaf import Network
-from collections.abc import Callable
-import polars as pl
-import pickle
 
 
 def memoize(func: Callable) -> Callable:
@@ -91,7 +91,8 @@ def save_metrics(
         metrics['simulation'] = cfg.simulation
     elif dict_type == 'learnable':
         metrics['seed'] = cfg.seed
-        metrics['lambda'] = cfg.coder.regularizer
+        metrics['lambda'] = cfg.coder.sparse_regularizer
+        metrics['gamma'] = cfg.coder.dict_regularizer
         metrics['dict_type'] = dict_type
         metrics['simulation'] = cfg.simulation
         metrics['augmented_multiplier_dict'] = (
@@ -105,10 +106,9 @@ def save_metrics(
     filename = (
         (
             f'{metrics_type}_metrics_{cfg.simulation}_'
-            + f'{cfg.coder.regularizer}_'
+            + f'{cfg.coder.sparse_regularizer}_'
+            + f'{cfg.coder.dict_regularizer}_'
             + f'{cfg.coder.dict_type}_'
-            + f'{cfg.coder.augmented_multiplier_dict}_'
-            + f'{cfg.coder.augmented_multiplier_sparse}_'
             + f'sampling_strategy_{cfg.coder.subsampling_strategy}_'
             + f'{cfg.seed}.parquet'
         )

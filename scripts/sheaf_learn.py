@@ -1,21 +1,30 @@
 """
-This python module handles the network formation using numpy arrays.
+This python module handles semantic network formation .
 """
 
 import sys
+import hydra
+import wandb
+import numpy as np
+from typing import Any
 from pathlib import Path
-from utils import save_metrics
+from tqdm.auto import tqdm
+from omegaconf import OmegaConf
+import matplotlib.pyplot as plt
+from hydra.core.hydra_config import HydraConfig
 
 sys.path.append(str(Path(sys.path[0]).parent))
 
-from src import Network, EdgeProblemProcrustes
-from hydra.core.hydra_config import HydraConfig
-from omegaconf import OmegaConf
-from tqdm.auto import tqdm
-from typing import Any
-import numpy as np
-import hydra
-import wandb
+from utils import save_metrics
+from src import EdgeProblemProcrustes, Network
+
+try:
+    base_dir = Path(__file__).parent.parent
+except NameError:
+    base_dir = Path.cwd()
+
+style_path = base_dir / '.conf' / 'plotting' / 'plt.mplstyle'
+plt.style.use(style_path.resolve())
 
 
 @hydra.main(
@@ -50,14 +59,16 @@ def main(cfg) -> None:
     else:
         name = (
             f'dict_type_{coder_params["dict_type"]}_'
-            f'atoms_{coder_params["n_atoms"]}_'
-            + f'reg_{coder_params["regularizer"]}_'
+            + f'atoms_{coder_params["n_atoms"]}_'
+            + f'dict_init_{coder_params["init_mode_dict"]}_'
+            + f'sreg_{coder_params["sparse_regularizer"]}_'
+            + f'dreg_{coder_params["dict_regularizer"]}_'
             + f'subsample_{coder_params["n_subsampling"]}_'
             + f'subsample_{coder_params["subsampling_strategy"]}_'
             # + f'initD_{coder_params["init_mode_dict"]}_'
             # + f'momentum_{coder_params["momentum_D"]}_'
             # + f'stepS{coder_params["Sstep"]}_'
-            # + f'stepD{coder_params["Dstep"]}_'
+            + f'stepD{coder_params["Dstep"]}_'
             # + f'Diter{coder_params["D_iters"]}_'
             + f'maxiter{coder_params["max_iter"]}_'
             f'job{hc.job.num}' + f'{rcode}'
@@ -88,6 +99,10 @@ def main(cfg) -> None:
     )
     print('[Passed]')
 
+    print(
+        f'Sanity check on dict rank: {np.linalg.matrix_rank(net.globalDict)}'
+    )
+
     # ================================================================
     #                        Sheaf Alignment
     # ================================================================
@@ -104,18 +119,26 @@ def main(cfg) -> None:
 
             prob.fit()
 
-    net.update_graph(n_edges=n_edges)
     print('[Passed]')
 
     # ================================================================
     #                        Evaluation
     # ================================================================
     print('Starting maps evaluation...', end='\t')
-    net.eval()
-    net.sheaf_plot(
-        n_clusters=cfg.visualization.nclusters,
-        layout=cfg.visualization.layout,
-    )
+    if cfg.visualization.threshold_study:
+        net.persistent_eval(
+            n_clusters=cfg.visualization.nclusters,
+            layout=cfg.visualization.layout,
+        )
+    else:
+        net.update_graph(n_edges=n_edges)
+        net.eval()
+        net.sheaf_plot(
+            n_clusters=cfg.visualization.nclusters,
+            layout=cfg.visualization.layout,
+            n_thresh=cfg.visualization.n_thresh,
+        )
+
     if cfg.visualization.plot_restriction_maps:
         net.restriction_maps_heatmap(cfg.alignment.n_edges)
     if cfg.visualization.plot_pca_correlation:
@@ -153,4 +176,6 @@ def main(cfg) -> None:
 
 
 if __name__ == '__main__':
+    style_path = Path('..') / '.conf' / 'plotting' / 'plt.mplstyle'
+    print(f'Plotting pathhhhhhhh: {style_path}')
     main()

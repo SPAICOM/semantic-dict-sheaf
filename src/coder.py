@@ -5,25 +5,28 @@ from pathlib import Path
 
 sys.path.append(str(Path(sys.path[0]).parent))
 
+from typing import Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+import torch
+from numpy.linalg import inv, norm, svd, slogdet
+from scipy.sparse.linalg import cg
+from sklearn.decomposition import PCA
 from sklearn.linear_model import Lasso, OrthogonalMatchingPursuit
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from numpy.linalg import norm, inv
-from scipy.sparse.linalg import cg
-from typing import Any
-from wandb import Image
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import torch
 
 from src.utils import (
+    corr_heatmap,
     block_thresholding,
+    colnorm,
     convert_output,
     dct_matrix,
-    colnorm,
     n_atoms,
+    proximal_logdet,
 )
+from wandb import Image
 
 
 class SparseCoder:
@@ -172,6 +175,7 @@ class GlobalDict:
         self,
         X: np.ndarray,
         agents: dict[int, dict[str, Any]],
+        test_gt_dict: np.ndarray = None,
         run=None,
         n_nodes: int = 1,
         params: dict[Any] = {},
@@ -180,10 +184,13 @@ class GlobalDict:
         #                          Parameters
         # ================================================================
         defaults = {
-            'augmented_multiplier_dict': None,
             'augmented_multiplier_sparse': None,
+            'augmented_multiplier_dict': None,
+            'dict_regularization_type': None,
             'explained_variance': None,
             'sparsity_tolerance': 1e-3,
+            'sparse_regularizer': None,
+            'dict_regularizer': None,
             'best_stepsize': False,
             'sparsity_level': None,
             'coding_method': 'lasso',
@@ -191,7 +198,6 @@ class GlobalDict:
             'hard_thresh': False,
             'init_mode_dict': 'random',
             'init_mode_sparse': 'zeros',
-            'regularizer': None,
             'dict_type': None,
             'momentum_D': None,
             'momentum_S': None,
@@ -207,8 +213,10 @@ class GlobalDict:
             'tol': 1e-3,
         }
         defaults.update(params)
-        self.rho_dict = defaults['augmented_multiplier_dict']
+        self.dict_regularization_type = defaults['dict_regularization_type']
         self.rho_sparse = defaults['augmented_multiplier_sparse']
+        self.rho_dict = defaults['augmented_multiplier_dict']
+        self.dict_regularizer = defaults['dict_regularizer']
         self.init_mode_sparse = defaults['init_mode_sparse']
         self.init_mode_dict = defaults['init_mode_dict']
         self.coding_method = defaults['coding_method']
@@ -218,7 +226,7 @@ class GlobalDict:
         self.ev = defaults['explained_variance']
         self.dict_type = defaults['dict_type']
         self.k0 = defaults['sparsity_level']
-        self.alpha = defaults['regularizer']
+        self.alpha = defaults['sparse_regularizer']
         self.momentum_D = defaults['momentum_D']
         self.momentum_S = defaults['momentum_S']
         self.max_iter = defaults['max_iter']
@@ -260,6 +268,7 @@ class GlobalDict:
         self._init_dictionary()
         self._init_sparse()
         self.S: np.ndarray = np.hstack(self.localS)
+        self.test_gt_dict = test_gt_dict
 
     def local_vars(
         self,
@@ -336,45 +345,64 @@ class GlobalDict:
             cmap='jet',
         ).set(xticks=[])
 
-    def eval(
+    def plot_dict(
         self,
-        dict_update: bool = False,
-        splitted: bool = False,
+        iteration: int,
     ) -> None:
-        reg_var = self.Z if splitted else self.S
-        reg = (
+        sns.heatmap(
+            self.D,
+            cmap='viridis',
+            cbar_kws={'label': 'Value'},
+        )
+        plt.xlabel('')
+        plt.ylabel('')
+        plt.xticks([])
+        plt.yticks([])
+        plt.tight_layout()
+        self.run.log(
+            {f'global_dict_step{iteration}': Image(plt)}, step=self.global_step
+        )
+        plt.close()
+        return None
+
+    def eval(self) -> None:
+        reg_var = self.Z if self.split in ['both', 'sparse'] else self.S
+        sparse_reg = (
             np.count_nonzero(norm(reg_var, ord=2, axis=1)) * self.alpha
             if self.thresh
             else self.alpha * norm(reg_var, ord=2, axis=1).sum()
         )
+        if self.dict_regularization_type == 'logdet':
+            sign, det = slogdet(self.D.T @ self.D)
+            dict_reg = sign * det
+        else:
+            dict_reg = 0
         mse = (norm(self.X - self.D @ self.S) ** 2) / 2
-        loss = mse + reg
+        loss = mse + sparse_reg + dict_reg
         norm_loss = self.const * loss
         if (self.loss - loss) < self.tol:
             self.stop_cond += 1
         self.loss = loss
         self.nmse = self.const * mse
         self.sparsity = np.count_nonzero(norm(self.S, ord=2, axis=1))
-        # if dict_update:
-        #     print(f'D update: {self.loss}')
-        # else:
-        #     print(f'S update: {self.loss}')
-        #     print(f'{self.S=}')
         if self.run is not None:
-            if dict_update:
-                self.run.log(
-                    {'Dict Learning Loss': self.loss}, step=self.global_step
+            if self.test_gt_dict is not None:
+                approx_error = (norm(self.D - self.test_gt_dict) ** 2) / (
+                    norm(self.test_gt_dict) ** 2
                 )
-            else:
                 self.run.log(
-                    {'Sparse Coding Loss': self.loss}, step=self.global_step
+                    {'Dict approx error': approx_error},
+                    step=self.global_step,
                 )
-            self.run.log({'Total loss': self.loss}, step=self.global_step)
+                self.run.log(
+                    {'Dict_residual': self.residual},
+                    step=self.global_step,
+                )
+            # self.run.log({'Total loss': self.loss}, step=self.global_step)
             self.run.log({'Norm. tot. loss': norm_loss}, step=self.global_step)
-            self.run.log({'Reconstruction error': mse}, step=self.global_step)
+            self.run.log({'NMSE': self.nmse}, step=self.global_step)
             self.global_step += 1
-            # print(f'Total step: {self.global_step}')
-            # print(f'{self.stop_cond=}')
+
         return None
 
     def compute_stepsize(
@@ -384,7 +412,7 @@ class GlobalDict:
     ) -> None:
         if varname == 'D':
             self.Dstep = (
-                1.0 / np.linalg.norm(self.S, 2) ** 2 + self.rho_sparse
+                1.0 / norm(self.S, 2) ** 2 + self.rho_sparse
                 if splitted
                 else self.Dstep
             )
@@ -425,7 +453,7 @@ class GlobalDict:
             if self.stop_cond >= self.patience:
                 break
         self.S = np.hstack(self.localS)
-        self.eval(splitted=False)
+        self.eval()
         return None
 
     def _splitted_sparse_coding(self) -> None:
@@ -448,7 +476,7 @@ class GlobalDict:
         self.S = np.hstack(self.localS)
         self.Z = np.hstack(localZ)
         self.U = np.hstack(localU)
-        self.eval(splitted=True)
+        self.eval()
         return None
 
     def _update_dictionary(self) -> None:
@@ -459,7 +487,7 @@ class GlobalDict:
                 self.S @ self.S.T, self.S @ self.X.T, rcond=None
             )[0].T
             self.D = colnorm(self.D)
-            self.eval(dict_update=True)
+            self.eval()
         else:
             delta_D = None if self.momentum_D is None else 0
             for _ in range(self.D_iters):
@@ -471,7 +499,7 @@ class GlobalDict:
                 )
                 self.D += delta_D
                 self.D = colnorm(self.D)
-                self.eval(dict_update=True)
+                self.eval()
                 if self.stop_cond >= self.patience:
                     break
         return None
@@ -481,24 +509,53 @@ class GlobalDict:
         tol=1e-5,
         maxit=200,
     ) -> None:
-        A = self.S @ self.S.T + self.rho_dict * np.eye(self.n_atoms)  # k×k SPD
-        B = self.X @ self.S.T + self.rho_dict * (self.P - self.R)  # d×k
-        # D = np.empty_like(B)
-        for r in range(B.shape[0]):  # row rms
+        A = self.S @ self.S.T + self.rho_dict * np.eye(self.n_atoms)
+        B = self.X @ self.S.T + self.rho_dict * (self.P - self.R)
+        for r in range(B.shape[0]):
             self.D[r], _ = cg(A, B[r], rtol=tol, maxiter=maxit)
         return None
 
-    def _splitted_update_dictionary(
-        self,
-        splitted_reg: bool = True,
-    ) -> None:
+    def _splitted_update_dictionary(self) -> None:
+        # Closed-form solution
         if self.D_iters is None:
-            self.D = (
-                self.X @ self.S.T + self.rho_dict * (self.P - self.R)
-            ) @ inv(self.S @ self.S.T + self.rho_dict * np.eye(self.n_atoms))
+            D_old = self.D.copy()
+            if self.dict_regularization_type is None:
+                self.D = (
+                    self.X @ self.S.T + self.rho_dict * (self.P - self.R)
+                ) @ inv(
+                    self.S @ self.S.T + self.rho_dict * np.eye(self.n_atoms)
+                )
+            elif self.dict_regularization_type == 'logdet':
+                assert self.Dstep is not None, (
+                    'step size in D cannot be None if "logdet" regularization is used'
+                )
+                linearized_reg = (
+                    self.dict_regularizer * self.D @ inv(self.D.T @ self.D)
+                )
+                D_new = (
+                    self.X @ self.S.T
+                    + self.rho_dict * (self.P - self.R)
+                    + linearized_reg
+                ) @ inv(
+                    self.S @ self.S.T + self.rho_dict * np.eye(self.n_atoms)
+                )
+                self.D = self.D + self.Dstep * (D_new - self.D)
+                # Q, unconstrained_evals, Wt = svd(self.D)
+                # constrained_evals = proximal_logdet(
+                #     unconstrained_evals,
+                #     epsilon=0,
+                #     lam=self.dict_regularizer,
+                # )
+                # self.D = Q @ np.diag(constrained_evals) @ Wt
+            else:
+                pass
+
+            self.residual = norm(self.D - D_old) ** 2
             self.P = colnorm(self.D + self.R)
             self.R += self.D - self.P
-            self.eval(splitted=splitted_reg, dict_update=True)
+            self.eval()
+
+        # Smooth descending
         else:
             if self.best_stepsize:
                 self.compute_stepsize(varname='D', splitted=True)
@@ -512,7 +569,7 @@ class GlobalDict:
                     self.D -= self.Dstep * grad
                 self.P = colnorm(self.D + self.R)
                 self.R += self.D - self.P
-                self.eval(splitted=splitted_reg, dict_update=True)
+                self.eval()
                 if self.stop_cond >= self.patience:
                     break
         return None
@@ -553,7 +610,7 @@ class GlobalDict:
                 #                    UPDATE GLOBAL DICTIONARY
                 # =============================================================
                 if self.split in ['both', 'dict']:
-                    self._splitted_update_dictionary(splitted_reg=False)
+                    self._splitted_update_dictionary()
                 else:
                     self._update_dictionary()
                 # =============================================================
@@ -563,6 +620,15 @@ class GlobalDict:
                     self._splitted_sparse_coding()
                 else:
                     self._sparse_coding(coder_params=coder_params)
+
+                # if i % 100 == 0:
+                # corr_heatmap(self.D)
+                # self.run.log(
+                #     {f'dict_corr_step{i}': Image(plt)},
+                #     step=self.global_step,
+                # )
+                # plt.close()
+                # self.plot_dict(iteration=i)
 
                 # =============================================================
                 #                  EARLY STOPPING CRITERION
@@ -605,7 +671,7 @@ class GlobalDict:
         #             self.stop_cond = 0
 
         elif self.dict_type == 'fourier':
-            self.D = dct_matrix(self.stalk_dim, norm='sqrtn')
+            self.D = dct_matrix(self.stalk_dim)
         elif self.dict_type == 'local_pca':
             assert self.S_iters == 1, (
                 'S_iters must be 1 for local PCA dictionary.'
@@ -633,7 +699,7 @@ class GlobalDict:
             metrics['agent_id'].append(i)
             metrics['sparsity'].append(n_atoms(torch.from_numpy(S_i)))
             metrics['nmse'].append(
-                (norm(X_i - D_i @ S_i) ** 2 / 2) / self.n_examples
+                (norm(X_i - D_i @ S_i) ** 2 / 2) / norm(X_i) ** 2
             )
 
         return metrics

@@ -14,17 +14,15 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.sparse import csgraph
 from tqdm.auto import tqdm
+from wandb import Image
 import jax.numpy as jnp
 from typing import Any
 import igraph as ig
+import pandas as pd
 import numpy as np
+import logging
 import torch
-
-
-# import matplotlib.patches as mpatches
-
-# from matplotlib.colors import Normalize
-from wandb import Image
+import os
 
 from src.utils import (
     cross_cosine_similarity,
@@ -33,13 +31,17 @@ from src.utils import (
     random_stiefel,
     convert_output,
     convert_input,
+    corr_heatmap,
     create_proto,
     prewhiten,
     n_atoms,
 )
 from src.datamodules import DataModuleClassifier
 from src.coder import SparseCoder, GlobalDict
+from src.visualize import threshold_study
 from src.neural import Classifier
+
+logging.getLogger('pytorch_lightning').setLevel(logging.ERROR)
 
 
 class Agent:
@@ -119,18 +121,54 @@ class Agent:
         self.restriction_maps[neighbour_id] = map_value
         return None
 
-    def latent_initialization(
-        self,
-        dataset: str = 'cifar10',
-    ) -> None:
+    def latent_initialization(self) -> None:
         """ """
-        self.datamodule = DataModuleClassifier(
-            dataset=dataset, rx_enc=self.model_name
-        )
-        self.datamodule.prepare_data()
-        self.datamodule.setup()
-        self.X_train = self.datamodule.train_data.input.T
-        self.X_test = self.datamodule.test_data.input.T
+        if self.dataset == 'test':
+            latent_dim = 10
+            sparsity = 3
+            m_train = 100
+            m_test = 30
+            n_examples = m_train + m_test
+
+            def create_column_vec(row, latent_dim):
+                tmp = np.zeros(latent_dim)
+                tmp[row['idxs']] = row['non_zero_coeff']
+                return tmp
+
+            self.gt_global_dict = random_stiefel(
+                latent_dim,
+                latent_dim,
+                seed=self.seed,
+            ).to(self.device)
+            D = self.gt_global_dict
+            tmp = pd.DataFrame()
+            # tmp['K0'] = np.random.choice(
+            #     np.arange(1, latent_dim + 1), size=(n_examples), replace=True
+            # )
+            tmp['K0'] = np.full((n_examples,), sparsity)
+            tmp['idxs'] = tmp.K0.apply(
+                lambda x: np.random.choice(latent_dim, size=x, replace=False)
+            )
+            tmp['non_zero_coeff'] = tmp.K0.apply(lambda x: np.random.randn(x))
+            tmp['column_vec'] = tmp.apply(
+                lambda x: create_column_vec(x, latent_dim=latent_dim), axis=1
+            )
+            self.S = np.column_stack(tmp['column_vec'].values)
+
+            data = D @ self.S
+            self.S_train = self.S[:, :m_train]
+            self.S_test = self.S[:, m_train:]
+            self.X_train = data[:, :m_train]
+            self.X_test = data[:, m_train:]
+        else:
+            self.datamodule = DataModuleClassifier(
+                dataset=self.dataset,
+                rx_enc=self.model_name,
+            )
+            self.datamodule.prepare_data()
+            self.datamodule.setup()
+            self.X_train = self.datamodule.train_data.input.T
+            self.X_test = self.datamodule.test_data.input.T
         self.stalk_dim = self.X_train.shape[0]
         self.n_examples = self.X_train.shape[1]
         return None
@@ -166,8 +204,13 @@ class Agent:
         dl = DataLoader(
             TensorDataset(data.T, self.datamodule.test_data.labels),
             batch_size=self.datamodule.batch_size,
+            # num_workers=os.cpu_count(),
         )
-        res = trainer.test(model=self.model, dataloaders=dl)
+        res = trainer.test(
+            model=self.model,
+            dataloaders=dl,
+            verbose=False,
+        )
         return res[0]['test/acc_epoch'], res[0]['test/loss_epoch']
 
     @convert_output
@@ -438,7 +481,7 @@ class Network:
         self.coder_params.update(coder_params)
 
         # Init Agents
-        X_train_dict = []
+        X_train_stack = []
         for idx, info in agents_info.items():
             self.agents[idx] = Agent(
                 id=idx,
@@ -456,13 +499,21 @@ class Network:
                 subsampling_strategy=self.coder_params['sampling_strategy'],
                 out='numpy',
             )
-            X_train_dict.append(X)
+            X_train_stack.append(X)
 
         self.n_agents = len(self.agents)
-        X_train_dict = np.hstack(X_train_dict)
+        X_train_stack = np.hstack(X_train_stack)
+
+        try:
+            gt_dictionary = (
+                self.agents[0].gt_global_dict.detach().cpu().numpy()
+            )
+        except AttributeError:
+            gt_dictionary = None
 
         self.set_global_dictionary(
-            X_train_dict,
+            X_train_stack,
+            gt_dictionary=gt_dictionary,
             dict_params=self.coder_params,
         )
 
@@ -505,12 +556,14 @@ class Network:
     def set_global_dictionary(
         self,
         X_train: np.ndarray,
+        gt_dictionary: np.ndarray = None,
         dict_params: dict[Any] = {},
     ) -> None:
         GD = GlobalDict(
             X=X_train,
             agents=self.agents,
             n_nodes=self.n_agents,
+            test_gt_dict=gt_dictionary,
             params=dict_params,
             run=self.run,
         )
@@ -545,30 +598,81 @@ class Network:
         del edge_dims, node_dims, n
         return None
 
-    def get_edge_losses(self) -> dict[tuple[int, int], float]:
+    def get_edge_losses(
+        self,
+        agent_id: int = None,
+    ) -> dict[tuple[int, int], float]:
         """Return a dictionary with the edge ids as keys and the corresponding edge losses as values."""
-        return {
-            edge.id: edge.return_alignment_loss()
-            for edge in self.edges.values()
-        }
+        if agent_id is None:
+            losses = {
+                edge.id: edge.return_alignment_loss()
+                for edge in self.edges.values()
+            }
+        else:
+            losses = {}
+            for edge in self.edges.values():
+                if agent_id in edge.id:
+                    losses[edge.id] = edge.return_alignment_loss()
+
+        return losses
+
+    def cutting_edge_thresholds(
+        self,
+        n_thresholds: int,
+    ) -> np.ndarray:
+        all_edge_losses = np.array(list(self.get_edge_losses().values()))
+        min_losses = []
+        max_losses = []
+        for agent in self.agents.values():
+            neighbor_losses = np.array(
+                list(self.get_edge_losses(agent_id=agent.id).values())
+            )
+            min_losses.append(np.min(neighbor_losses))
+            max_losses.append(np.max(neighbor_losses))
+
+        min_thresh = np.max(min_losses)
+        max_thresh = np.max(max_losses)
+        valid_losses = all_edge_losses[
+            (all_edge_losses >= min_thresh) & (all_edge_losses <= max_thresh)
+        ]
+
+        # Compute quantile-based thresholds
+        quantiles = np.linspace(0, 1, n_thresholds)
+        sampled_thresholds = np.quantile(valid_losses, quantiles)
+        print(f'{sampled_thresholds=}')
+        return sampled_thresholds
 
     def update_graph(
         self,
-        n_edges: int,
+        n_edges: int = None,
+        cutting_threshold: int = None,
     ) -> None:
-        """Update the graph based on the edge losses."""
-        assert (n_edges > 0) and (n_edges <= len(self.graph.get_edgelist())), (
-            'n_edges must be a positive integer, smaller than the current number of edges in the graph.'
-        )
-
         edge_losses = self.get_edge_losses()
-        to_remove = list(
-            dict(sorted(edge_losses.items(), key=lambda item: item[1])).keys()
-        )[n_edges:]
+        """Update the graph based on the edge losses."""
+        if cutting_threshold is None:
+            if n_edges is None:
+                n_edges = int(self.n_agents * (self.n_agents - 1) / 2)
+            assert (n_edges > 0) and (
+                n_edges <= len(self.graph.get_edgelist())
+            ), (
+                'n_edges must be a positive integer, smaller than the current number of edges in the graph.'
+            )
+            to_remove = list(
+                dict(
+                    sorted(edge_losses.items(), key=lambda item: item[1])
+                ).keys()
+            )[n_edges:]
+        else:
+            to_remove = [
+                edge
+                for edge, loss in edge_losses.items()
+                if loss > cutting_threshold
+            ]
         eids = self.graph.get_eids(to_remove, directed=False, error=False)
         eids = [eid for eid in eids if eid >= 0]
         self.graph.delete_edges(eids)
-        self.n_edges = n_edges
+        self.n_edges = len(self.graph.es)
+        return None
 
     def prepare_message(
         self,
@@ -652,7 +756,7 @@ class Network:
         )
 
         # Update the edge task performances
-        print((rx_id, tx_id), accuracy, loss)
+        # print((rx_id, tx_id), accuracy, loss)
         if (tx_id, rx_id) in self.edges:
             edge = (tx_id, rx_id)
             reverse = False
@@ -725,6 +829,9 @@ class Network:
             agent.acc, agent.loss = (acc, loss)
         return None
 
+    def return_network_performance(self) -> list:
+        return [agent.acc.item() for agent in self.agents.values()]
+
     def return_alignment_metrics(self) -> dict[str, float]:
         """Compute alignment loss for network edges.
         Report edge-level metrics for alignment and task performance comparison.
@@ -789,8 +896,10 @@ class Network:
         with_labels: bool = True,
         n_clusters: int = None,
         seed: int = 42,
+        threshold: int = None,
     ) -> None:
         """Plot the sheaf with a slim right colorbar, node numbers inside nodes, and a table below."""
+
         # --- Edge weights & labels
         edge_losses = self.get_edge_losses()
         weights = [
@@ -808,9 +917,39 @@ class Network:
         else:
             layout = self.graph.layout(layout)
 
-        # --- Optional spectral clustering
+        # --- Clustering in groups
         if n_clusters is None:
-            mark_groups = None
+            # --- Group nodes by model prefix
+            names = [a.model_name for a in self.agents.values()]
+            prefixes = [n.split('_')[0] for n in names]
+            unique_prefixes = sorted(set(prefixes))
+
+            # Build mark_groups as a list of lists (one sublist per prefix)
+            mark_groups = [
+                [i for i, p in enumerate(prefixes) if p == pref]
+                for pref in unique_prefixes
+            ]
+
+            # Use a darker / more saturated colormap (Set2 or Dark2 instead of Pastel1)
+            palette = cm.get_cmap('Set2', max(1, len(unique_prefixes)))
+
+            # Convert to RGBA with alpha=0.7 (more visible)
+            alpha = 0.7
+            mark_colors = [
+                (*palette(i)[:3], alpha) for i in range(len(unique_prefixes))
+            ]
+
+            # Combine groups and colors into tuples for igraph
+            mark_tuples = list(zip(mark_groups, mark_colors))
+
+            # --- Per-vertex borders to reinforce groups
+            border_palette = cm.get_cmap('Dark2', max(1, len(unique_prefixes)))
+            frame_colors = [
+                (*border_palette(unique_prefixes.index(p))[:3], 1.0)
+                for p in prefixes
+            ]  # full opacity
+            frame_widths = [2.0] * len(prefixes)
+
         else:
             n = len(self.graph.vs)
             A = np.zeros((n, n), dtype=float)
@@ -842,7 +981,7 @@ class Network:
         )
         sp_min, sp_max = np.min(sparsities), np.max(sparsities)
         denom = (sp_max - sp_min) if (sp_max - sp_min) > 0 else 1.0
-        min_size, max_size = 26.0, 72.0  # enlarged range
+        min_size, max_size = 40.0, 70.0  # enlarged range
         self.graph.vs['size'] = (
             min_size + ((sparsities - sp_min) / denom) * (max_size - min_size)
         ).tolist()
@@ -869,26 +1008,40 @@ class Network:
         else:
             self.graph.vs['label'] = None
 
+        self.graph.vs['label_size'] = 18
+        self.graph.es['label_size'] = 18
+
         # --- Figure: graph on top, table below
         fig = plt.figure(figsize=(16, 11))
         gs = fig.add_gridspec(
-            nrows=2, ncols=1, height_ratios=[0.78, 0.22], hspace=0.10
+            nrows=2,
+            ncols=1,
+            height_ratios=[0.78, 0.22],
+            hspace=0.1,
         )
         ax_graph = fig.add_subplot(gs[0, 0])
         ax_table = fig.add_subplot(gs[1, 0])
+
+        # label_color = (
+        #     self.graph.vs['label_color']
+        #     if 'label_color' in self.graph.vs.attributes()
+        #     else None
+        # )
 
         # --- Draw graph (no titles)
         ig.plot(
             self.graph,
             target=ax_graph,
             layout=layout,
-            vertex_color=self.graph.vs['color'],
-            vertex_size=self.graph.vs['size'],
+            vertex_color=self.graph.vs['color'],  # accuracy
+            vertex_size=self.graph.vs['size'],  # sparsity/dim
             vertex_label=self.graph.vs['label'],
-            # DO NOT pass vertex_label_color here — use per-vertex attribute set above
+            vertex_frame_color=frame_colors,
+            vertex_frame_width=frame_widths,
             edge_color=self.graph.es['color'],
             edge_label=self.graph.es['label'],
-            mark_groups=mark_groups,
+            mark_groups=mark_tuples,
+            backend='matplotlib',
             bbox=(300, 300),
             margin=40,
         )
@@ -898,10 +1051,10 @@ class Network:
         sm.set_array([])
         divider = make_axes_locatable(ax_graph)
         cax = divider.append_axes(
-            'right', size='0.6%', pad=0.02
+            'right', size='0.8%', pad=0.02
         )  # small & tidy
         cbar = fig.colorbar(sm, cax=cax, orientation='vertical')
-        cbar.set_label('Avg. Accuracy', fontsize=13, rotation=90, labelpad=10)
+        cbar.set_label('Avg. Accuracy', fontsize=18, rotation=90, labelpad=10)
         cbar.set_ticks([0.0, 0.5, 1.0])
         cbar.ax.tick_params(labelsize=12, length=3)  # larger tick numbers
         cbar.outline.set_visible(False)
@@ -925,12 +1078,50 @@ class Network:
             loc='center',
         )
         table.auto_set_font_size(False)
-        table.set_fontsize(11)
+        table.set_fontsize(16)
         table.scale(1.05, 1.18)
+        log_name = (
+            f'final_network_thresh{round(threshold, 3)}'
+            if threshold is not None
+            else 'final_network'
+        )
+        plt.tight_layout(pad=1.0)
+        self.run.log({log_name: Image(fig)})
+        return None
 
-        plt.tight_layout()
-        self.run.log({'final_network': Image(fig)})
-        plt.close()
+    def persistent_eval(
+        self,
+        n_thresh: int = 20,
+        layout: str = None,
+        with_labels: bool = True,
+        n_clusters: int = None,
+        seed: int = 42,
+    ) -> None:
+        thresholds = self.cutting_edge_thresholds(n_thresholds=n_thresh)
+        metrics = {
+            'threshold': [],
+            'agent_id': [],
+            'task_accuracy': [],
+            'n_edges': [],
+        }
+        for t in thresholds[::-1]:
+            self.update_graph(cutting_threshold=t)
+            self.eval()
+            self.sheaf_plot(
+                layout=layout,
+                with_labels=with_labels,
+                n_clusters=n_clusters,
+                threshold=t,
+                seed=seed,
+            )
+            metrics['threshold'] += [float(t)] * self.n_agents
+            metrics['n_edges'] += [self.n_edges] * self.n_agents
+            metrics['task_accuracy'] += (
+                self.return_network_performance()
+            )  # returns a list
+            metrics['agent_id'] += list(self.agents.keys())
+
+        threshold_study(run=self.run, data=metrics)
         return None
 
     def restriction_maps_heatmap(
@@ -939,7 +1130,7 @@ class Network:
     ) -> None:
         """Plot the restriction maps for the best n communication edges."""
         cols = n // 2
-        fig, axes = plt.subplots(2, cols, figsize=(10, 5))
+        _, axes = plt.subplots(2, cols, figsize=(10, 5))
 
         for ax, edge in zip(axes.flatten(), list(self.edges.values())):
             _, F_j = edge.get_restriction_maps(out='numpy')
@@ -997,17 +1188,58 @@ class Network:
         return None
 
     def global_dict_corr_heatmap(self) -> None:
-        corr = np.corrcoef(self.globalDict.numpy(), rowvar=False)
-        plot = sns.heatmap(
-            corr,
-            cmap='viridis',
-            # cbar_kws={'label': 'Value'},
-        )
-        # plt.xlabel('Principal Component')
-        # plt.ylabel('Principal Component')
+        plot = corr_heatmap(self.globalDict.numpy())
         plt.title('Global dict atoms cross-correlation')
         plt.tight_layout()
         self.run.log({'global_dict_correlation': Image(plot)})
+        plt.close()
+        return None
+
+    def gt_heatmaps(
+        self,
+        n: int = 4,
+    ) -> None:
+        # Groundtruth sparse representations
+        cols = n // 2
+        _, axes = plt.subplots(2, cols, figsize=(10, 5))
+        local_norms = []
+        agent_names = []
+        SS = []
+        for ax, agent in zip(axes.flatten(), list(self.agents.values())):
+            gt_global_dict = agent.gt_global_dict
+            S_i = agent.S_train
+            sns.heatmap(
+                S_i,
+                ax=ax,
+                cmap='viridis',
+                cbar_kws={'label': 'Value'},
+            )
+            ax.set_xlabel('')
+            ax.set_ylabel('')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f'Sparse on agent {agent.id}')
+            norms = np.linalg.norm(S_i, ord=2, axis=1)
+            local_norms.append(norms.reshape(-1, 1))
+            agent_names.append(agent.model_name)
+            SS.append(S_i)
+        plt.tight_layout()
+        self.run.log({'gt_sparse_representations': Image(plt)})
+        plt.close()
+        local_norms = np.hstack(local_norms)
+        sns.heatmap(
+            local_norms.T,
+            yticklabels=agent_names,
+            cmap='jet',
+        ).set(xticks=[])
+        plt.tight_layout()
+        self.run.log({'gt_sparsity': Image(plt)})
+        plt.close()
+        # Groundtruth global dictionary
+        plot = corr_heatmap(gt_global_dict)
+        plt.title('GT dict atoms cross-correlation')
+        plt.tight_layout()
+        self.run.log({'gt_dict': Image(plot)})
         plt.close()
         return None
 
