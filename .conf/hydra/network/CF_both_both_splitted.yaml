@@ -46,9 +46,6 @@ network:
       - cifar10
       - 42
 
-
-
-
 alignment:
   problem: procrustes
   verbose: true
@@ -62,17 +59,18 @@ coder:
   dict_type: learnable
   init_mode_dict: fourier
   init_mode_sparse: fourier
-  regularizer: 200
+  sparse_regularizer: 80 # 200
   n_atoms: null
-  max_iter: 1000 # 2000
+  max_iter: 2000
   tol: 1e-6
   patience: 30
-  hard_thresh: false
+  hard_thresh: false # false
   augmented_multiplier_dict: 1
   augmented_multiplier_sparse: 1
+  dict_regularizer: null
 
 visualization:
-  plot_restriction_maps: true
+  plot_restriction_maps: false
   plot_pca_correlation: false
   plot_global_dict_corr: true
   nclusters: null
@@ -85,4 +83,4 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      # coder.regularizer: 5, 20, 30, 40, 50, 60, 70, 80, 90 
+      # coder.regularizer: 5, 20, 30, 40, 50, 60, 70, 80, 90

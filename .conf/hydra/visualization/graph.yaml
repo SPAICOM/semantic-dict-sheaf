@@ -1,0 +1,13 @@
+
+value_fontsize: 12      # node labels, edge labels, colorbar tick labels
+axis_fontsize: 18       # colorbar label ("Avg. Accuracy")
+max_node_size: 50.0    # maximum node size used in scaling
+margin: 0.02            # spacing between subplots (wspace/hspace)
+kk_scale: 0.6
+edge_label_topk: 30
+
+graphs_pickle: "results/graphs.pkl"
+layout: "fruchterman_reingold"
+output_file: "sheaf_grid.pdf"
+n_edges: 15
+threshold: null

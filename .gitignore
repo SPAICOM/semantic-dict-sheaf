@@ -184,3 +184,8 @@ cython_debug/
 artifacts/
 semantic_network_formation_sheaves__classifier/
 models/
+thrash/
+results/*
+!results/.gitkeep
+plot/*
+!plot/.gitkeep

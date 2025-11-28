@@ -1,7 +1,8 @@
 seed: 42
 device: cpu
-simulation: CF_both_both_splitted
-save_results: True
+simulation: CF_both_both_splitted_dict_reg
+save_results: true
+compare_without_dictionary: false
 
 network:
   path: toy_example
@@ -12,77 +13,91 @@ network:
     - vit_small_patch16_224:
       - cifar10
       - 42
+      - 1e3
     - vit_small_patch16_384:
       - cifar10
       - 42
+      - 1e3
     - vit_small_patch32_224:
       - cifar10
       - 42
+      - 1e3
     - vit_small_patch32_384:
       - cifar10
       - 42
-    # - efficientvit_b2:
-    #   - cifar10
-    #   - 42
-    # - efficientvit_m4:
-    #   - cifar10
-    #   - 42
+      - 1e3
     - levit_128:
       - cifar10
       - 42
+      - 1e3
     - levit_192:
       - cifar10
       - 42
+      - 1e3
     - efficientvit_m4:
       - cifar10
       - 42
+      - 1e4
     - levit_conv_128:
       - cifar10
       - 42
+      - 1e3
     - volo_d1_224:
       - cifar10
       - 42
+      - 1e2
     - volo_d1_384:
       - cifar10
       - 42
+      - 1e2
 
 alignment:
   problem: procrustes
+  projected: true
   verbose: true
-  n_edges: 45
-  plotting_nclusters: 3
+  n_edges: 15
 
 coder:
   n_subsampling: 4000
   subsampling_strategy: proto
-  split: dict
+  split: both
   dict_type: learnable
-  coding_method: omp
-  sparse_descent: False
   init_mode_dict: fourier
-  init_mode_sparse: fourier
-  sparsity_tolerance: 1e-3
-  sparse_regularizer: 50
+  init_mode_sparse: random
+  sparse_regularizer: null
   n_atoms: null
-  max_iter: 1000 # 2000
-  tol: 1e-6
+  max_iter: 2000 # 3000
+  tol: 1e-2
   patience: 30
-  hard_thresh: false
+  hard_thresh: true
+  sparsity: 250
   augmented_multiplier_dict: 1
   augmented_multiplier_sparse: 1
+  dict_regularizer: 1
+  dict_regularization_type: logdet
+  Dstep: 0.3
+  Sstep: 0.3
 
 visualization:
-  plot_restriction_maps: true
+  threshold_study: false
+  n_thresh: null
+  threshold: null # 0.816, 0.75
+  plot_restriction_maps: false
   plot_pca_correlation: false
-  plot_global_dict_corr: true
-  nclusters: null
+  plot_global_dict_corr: false
+  nclusters: auto
   layout: kamada_kawai
 
 wandb:
-  project: CF_both_dict_splitted_sparse_omp
+  project: CF_both_both_splitted_dict_reg
 
 hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      # coder.regularizer: 5, 20, 30, 40, 50, 60, 70, 80, 90 
+      coder.sparsity: 30, 50, 100, 150, 200, 300, 384
+      # visualization.threshold: 0.75, 0.816
+      # coder.n_subsampling: 10, 20, 50, 70, 100, 200, 500, 700, 1000, 1500, 2000, 4000, 6000
+      # coder.sparse_regularizer: 1e-2, 1e-1, 1, 1e1, 1e2, 3e2
+      # coder.Dstep: 0.2, 0.5, 1.0
+      # coder.dict_regularizer: 5, 1, 1e-1, 5e-2

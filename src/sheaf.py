@@ -20,6 +20,7 @@ from typing import Any
 import igraph as ig
 import pandas as pd
 import numpy as np
+import pickle
 import logging
 import torch
 import os
@@ -53,10 +54,12 @@ class Agent:
         model: str,
         seed: int,
         dataset: str = 'cifar10',
+        regularizer: float = None,
         device: str = 'cpu',
         testing: bool = False,
         **kwargs: Any,
     ):
+        self.regularizer = regularizer
         self.device: str = device
         self.seed: int = seed
         self.id: int = id
@@ -323,7 +326,7 @@ class Edge:
             scale=scale,
             test=test,
         )
-        X_j, X_j_test = self.head.get_latent(
+        X_j, X_j_test = self.tail.get_latent(
             prewhite=prewhite,
             scale=scale,
             test=test,
@@ -431,11 +434,15 @@ class Edge:
         return self.task_accuracy, self.task_loss, self.alignment_loss
 
     def evaluate_sparsity_pattern_similarity(
-        self, method: str = 'cosine'
+        self,
+        method: str = 'cosine',
+        on_latent: bool = False,
     ) -> float:
         """Evaluate the similarity between the sparsity patterns of the two agents' sparse representations."""
-        head_norms = torch.norm(self.head.S, p=2, dim=1)
-        tail_norms = torch.norm(self.tail.S, p=2, dim=1)
+        representations_head = self.head.X_train if on_latent else self.head.S
+        representations_tail = self.tail.X_train if on_latent else self.tail.S
+        head_norms = torch.norm(representations_head, p=2, dim=1)
+        tail_norms = torch.norm(representations_tail, p=2, dim=1)
         if method == 'cosine':
             similarity = torch.nn.functional.cosine_similarity(
                 head_norms, tail_norms, dim=0
@@ -473,6 +480,7 @@ class Network:
         self.run = run
 
         self.coder_params: dict[Any] = {
+            'dict_type': None,
             'prewhite': False,
             'scale': False,
             'n_subsampling': None,
@@ -489,6 +497,7 @@ class Network:
                 dataset=info['dataset'],
                 seed=info['seed'],
                 device=self.device,
+                regularizer=info['regularizer'],
                 testing=info.get('testing', False),
                 **info.get('kwargs', {}),
             )
@@ -511,11 +520,15 @@ class Network:
         except AttributeError:
             gt_dictionary = None
 
-        self.set_global_dictionary(
-            X_train_stack,
-            gt_dictionary=gt_dictionary,
-            dict_params=self.coder_params,
-        )
+        if self.coder_params['dict_type'] is not None:
+            print(
+                'Learning the dictionary for projection the latent representations...'
+            )
+            self.set_global_dictionary(
+                X_train_stack,
+                gt_dictionary=gt_dictionary,
+                dict_params=self.coder_params,
+            )
 
         # Init Edges
         if edges_info is None:
@@ -553,12 +566,24 @@ class Network:
         self._is_connection_graph()
         del agents_info, edges_info
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # drop the wandb.Run object from the pickled state
+        state.pop('run', None)
+        return state
+
+    def __setstate__(self, state):
+        # restore state, with run set to None (or recreate later if needed)
+        self.__dict__.update(state)
+        self.run = None
+
     def set_global_dictionary(
         self,
         X_train: np.ndarray,
         gt_dictionary: np.ndarray = None,
         dict_params: dict[Any] = {},
     ) -> None:
+        regularizers = self.get_agent_regularizers()
         GD = GlobalDict(
             X=X_train,
             agents=self.agents,
@@ -566,6 +591,7 @@ class Network:
             test_gt_dict=gt_dictionary,
             params=dict_params,
             run=self.run,
+            regularizers=regularizers,
         )
         DD, SS = GD.fit(out='torch')
 
@@ -574,6 +600,7 @@ class Network:
             self.agents[i].sparsity = n_atoms(self.agents[i].S)
             self.agents[i].D = DD[i]
 
+        # Save dictionary learning metrics: TODO
         self.dict_metrics = GD.return_metrics()
         if self.coder_params['dict_type'] == 'learnable':
             self.globalDict = DD[0]
@@ -597,6 +624,9 @@ class Network:
         self.global_dim: int = n if self.is_connection_graph else None
         del edge_dims, node_dims, n
         return None
+
+    def get_agent_regularizers(self):
+        return [agent.regularizer for agent in self.agents.values()]
 
     def get_edge_losses(
         self,
@@ -639,7 +669,6 @@ class Network:
         # Compute quantile-based thresholds
         quantiles = np.linspace(0, 1, n_thresholds)
         sampled_thresholds = np.quantile(valid_losses, quantiles)
-        print(f'{sampled_thresholds=}')
         return sampled_thresholds
 
     def update_graph(
@@ -674,26 +703,26 @@ class Network:
         self.n_edges = len(self.graph.es)
         return None
 
-    def prepare_message(
-        self,
-        tx_id: int,
-    ) -> torch.Tensor:
-        """Prepare the message to be sent from tx_id to rx_id."""
+    # def prepare_message(
+    #     self,
+    #     tx_id: int,
+    # ) -> torch.Tensor:
+    #     """Prepare the message to be sent from tx_id to rx_id."""
 
-        _, X_te = self.agents[tx_id].get_latent(
-            prewhite=False,
-            scale=True,
-            test=True,
-            out='numpy',
-        )
-        coder = SparseCoder(
-            X=X_te,
-            dict_type='pca',
-            params=self.coder_params,
-        )
-        _, S = coder.fit(out='torch')
-        message = self.agents[tx_id].D @ S
-        return message
+    #     _, X_te = self.agents[tx_id].get_latent(
+    #         prewhite=False,
+    #         scale=True,
+    #         test=True,
+    #         out='numpy',
+    #     )
+    #     coder = SparseCoder(
+    #         X=X_te,
+    #         dict_type='pca',
+    #         params=self.coder_params,
+    #     )
+    #     _, S = coder.fit(out='torch')
+    #     message = self.agents[tx_id].D @ S
+    #     return message
 
     def send_message(
         self,
@@ -756,7 +785,6 @@ class Network:
         )
 
         # Update the edge task performances
-        # print((rx_id, tx_id), accuracy, loss)
         if (tx_id, rx_id) in self.edges:
             edge = (tx_id, rx_id)
             reverse = False
@@ -780,11 +808,12 @@ class Network:
         are the ones obtained by sending messages from the neighbors to the agent,
         aligned by the corresponding learned restriction maps.
         """
+        device = 'gpu' if self.device in ('cuda', 'mps') else 'cpu'
         trainer: Trainer = Trainer(
             inference_mode=True,
             enable_progress_bar=False,
             logger=False,
-            accelerator=self.device,
+            accelerator=device,
         )
         losses: dict[int, float] = {}
         accuracy: dict[str, float] = {}
@@ -829,8 +858,17 @@ class Network:
             agent.acc, agent.loss = (acc, loss)
         return None
 
-    def return_network_performance(self) -> list:
+    def return_network_acc(self) -> list:
         return [agent.acc.item() for agent in self.agents.values()]
+
+    def return_network_performance(self) -> tuple[float, float]:
+        # avg_acc = np.mean(np.array(self.return_network_acc()))
+        # avg_misalignment = np.mean(
+        #     np.array(list(self.get_edge_losses().values()))
+        # )
+        acc = np.array(self.return_network_acc())
+        misalignment = np.array(list(self.get_edge_losses().values()))
+        return acc, misalignment
 
     def return_alignment_metrics(self) -> dict[str, float]:
         """Compute alignment loss for network edges.
@@ -883,13 +921,14 @@ class Network:
                 'sparsity': self.dict_metrics['sparsity'],
                 'nmse': self.dict_metrics['nmse'],
                 'acc': [],
+                'degree': list(enumerate(self.graph.degree())),
             }
             for agent in self.agents.values():
                 metrics['acc'].append(agent.acc)
             self.dict_metrics = metrics
         return self.dict_metrics
 
-    @save_sheaf_plt
+    # @save_sheaf_plt
     def sheaf_plot(
         self,
         layout: str = None,
@@ -897,8 +936,10 @@ class Network:
         n_clusters: int = None,
         seed: int = 42,
         threshold: int = None,
-    ) -> None:
-        """Plot the sheaf with a slim right colorbar, node numbers inside nodes, and a table below."""
+    ):  # TODO: change output type
+        """Plot the sheaf with a slim right colorbar, node numbers inside nodes, and a table below.
+        Also save a second version of the image without the table.
+        """
 
         # --- Edge weights & labels
         edge_losses = self.get_edge_losses()
@@ -915,10 +956,13 @@ class Network:
                 graph=self.graph, layout=layout, seed=seed
             )
         else:
-            layout = self.graph.layout(layout)
+            if isinstance(layout, str):
+                layout = self.graph.layout(layout)
 
         # --- Clustering in groups
         if n_clusters is None:
+            mark_tuples, frame_colors, frame_widths = (None, None, None)
+        elif n_clusters == 'auto':
             # --- Group nodes by model prefix
             names = [a.model_name for a in self.agents.values()]
             prefixes = [n.split('_')[0] for n in names]
@@ -947,23 +991,10 @@ class Network:
             frame_colors = [
                 (*border_palette(unique_prefixes.index(p))[:3], 1.0)
                 for p in prefixes
-            ]  # full opacity
+            ]
             frame_widths = [2.0] * len(prefixes)
-
         else:
-            n = len(self.graph.vs)
-            A = np.zeros((n, n), dtype=float)
-            for e in self.graph.es:
-                A[e.source, e.target] = A[e.target, e.source] = e['weight']
-            L = csgraph.laplacian(A, normed=False)
-            _, eigvecs = np.linalg.eigh(L)
-            X = eigvecs[:, 1 : n_clusters + 1]
-            kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(X)
-            cluster_labels = kmeans.labels_.tolist()
-            self.graph.vs['cluster'] = cluster_labels
-            mark_groups = [[] for _ in range(n_clusters)]
-            for idx, label in enumerate(cluster_labels):
-                mark_groups[label].append(idx)
+            raise NotImplementedError
 
         # --- Node colors from accuracy [0,1] using RdYlGn
         agents_list = list(
@@ -972,16 +1003,22 @@ class Network:
         accs = np.array([float(a.acc) for a in agents_list], dtype=float)
         accs = np.clip(accs, 0.0, 1.0)
         cmap = cm.get_cmap('RdYlGn')
-        acc_norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+        # Colorbar and colors normalized between 0.5 and 1.0
+        acc_norm = mcolors.Normalize(vmin=0.5, vmax=1.0)
         self.graph.vs['color'] = [tuple(cmap(acc_norm(a))) for a in accs]
 
         # --- Node sizes: sparsity → larger range so numbers fit inside nodes
-        sparsities = np.array(
-            [float(a.sparsity) for a in agents_list], dtype=float
-        )
+        try:
+            sparsities = np.array(
+                [float(a.sparsity) for a in agents_list], dtype=float
+            )
+        except TypeError:
+            sparsities = np.array(
+                [float(a.stalk_dim) for a in agents_list], dtype=float
+            )
         sp_min, sp_max = np.min(sparsities), np.max(sparsities)
         denom = (sp_max - sp_min) if (sp_max - sp_min) > 0 else 1.0
-        min_size, max_size = 40.0, 70.0  # enlarged range
+        min_size, max_size = 40.0, 100.0  # enlarged range
         self.graph.vs['size'] = (
             min_size + ((sparsities - sp_min) / denom) * (max_size - min_size)
         ).tolist()
@@ -998,37 +1035,36 @@ class Network:
             self.graph.vs['label'] = [
                 str(i) for i in range(len(self.graph.vs))
             ]
-            # White text except when 0.3 <= acc <= 0.7 -> black (for yellow-ish nodes)
-            label_colors = [
-                'black' if 0.3 <= float(a) <= 0.7 else 'white' for a in accs
-            ]
-            self.graph.vs['label_color'] = label_colors  # per-vertex attribute
-            self.graph.vs['label_size'] = 14  # font size of numbers
+            # White text except when 0.65 <= acc <= 0.85 -> black (for yellow-ish nodes)
+            # label_colors = [
+            #     'black' if 0.65 <= float(a) <= 0.85 else 'white' for a in accs
+            # ]
+            self.graph.vs['label_color'] = 'black'  # per-vertex attribute
             self.graph.vs['label_dist'] = 0  # center inside nodes
         else:
             self.graph.vs['label'] = None
 
-        self.graph.vs['label_size'] = 18
-        self.graph.es['label_size'] = 18
+        self.graph.vs['label_size'] = 26
+        self.graph.es['label_size'] = 26
 
-        # --- Figure: graph on top, table below
+        # ------------------------------------------------------------------
+        # FIGURE WITH TABLE (graph + table + full-height right colorbar)
+        # ------------------------------------------------------------------
         fig = plt.figure(figsize=(16, 11))
         gs = fig.add_gridspec(
             nrows=2,
-            ncols=1,
+            ncols=2,
             height_ratios=[0.78, 0.22],
+            width_ratios=[
+                0.94,
+                0.06,
+            ],  # right column for colorbar spanning both rows
             hspace=0.1,
+            wspace=0.05,
         )
         ax_graph = fig.add_subplot(gs[0, 0])
         ax_table = fig.add_subplot(gs[1, 0])
 
-        # label_color = (
-        #     self.graph.vs['label_color']
-        #     if 'label_color' in self.graph.vs.attributes()
-        #     else None
-        # )
-
-        # --- Draw graph (no titles)
         ig.plot(
             self.graph,
             target=ax_graph,
@@ -1046,18 +1082,20 @@ class Network:
             margin=40,
         )
 
-        # --- Slim vertical colorbar on the RIGHT of the graph
-        sm = cm.ScalarMappable(norm=acc_norm, cmap=cmap)
-        sm.set_array([])
-        divider = make_axes_locatable(ax_graph)
-        cax = divider.append_axes(
-            'right', size='0.8%', pad=0.02
-        )  # small & tidy
-        cbar = fig.colorbar(sm, cax=cax, orientation='vertical')
-        cbar.set_label('Avg. Accuracy', fontsize=18, rotation=90, labelpad=10)
-        cbar.set_ticks([0.0, 0.5, 1.0])
-        cbar.ax.tick_params(labelsize=12, length=3)  # larger tick numbers
-        cbar.outline.set_visible(False)
+        # --- Full-height vertical colorbar on the RIGHT of the figure
+        if n_clusters is not None:
+            sm = cm.ScalarMappable(norm=acc_norm, cmap=cmap)
+            sm.set_array([])
+            cax = fig.add_subplot(
+                gs[:, 1]
+            )  # spans both rows -> whole right side
+            cbar = fig.colorbar(sm, cax=cax, orientation='vertical')
+            cbar.set_label(
+                'Avg. Accuracy', fontsize=28, rotation=90, labelpad=10
+            )
+            cbar.set_ticks([0.5, 0.75, 1.0])
+            cbar.ax.tick_params(labelsize=26, length=3)
+            cbar.outline.set_visible(False)
 
         # Hide graph ticks
         ax_graph.tick_params(
@@ -1080,14 +1118,40 @@ class Network:
         table.auto_set_font_size(False)
         table.set_fontsize(16)
         table.scale(1.05, 1.18)
+
         log_name = (
             f'final_network_thresh{round(threshold, 3)}'
             if threshold is not None
             else 'final_network'
         )
-        plt.tight_layout(pad=1.0)
+
+        # plt.tight_layout(pad=1.0)
+
+        # ------------------------------------------------------------------
+        # LOG / SAVE BOTH FIGURES
+        # ------------------------------------------------------------------
+        # Version with table (original behavior)
+        # path = os.path.join(os.getcwd(), 'plot')
+        # if not os.path.exists(path):
+        #     os.makedirs(path)
+        # save_path = os.path.join(
+        #     path,
+        #     f'{self.run.name}_{self.n_edges}_edges_{self.n_agents}_nodes_{threshold}_threshold.pdf',
+        # )
+        # fig_graph.savefig(save_path, bbox_inches='tight')
         self.run.log({log_name: Image(fig)})
-        return None
+        plt.close()
+
+        # Version without table
+        # self.run.log({f'{log_name}_graph_only': Image(fig_graph)})
+
+        # Save layout and threshold of the last plotting call
+        try:
+            self.layout = layout.coords
+        except AttributeError:
+            self.layout = layout
+        self.threshold = threshold
+        return self.layout, self.threshold
 
     def persistent_eval(
         self,
@@ -1096,7 +1160,7 @@ class Network:
         with_labels: bool = True,
         n_clusters: int = None,
         seed: int = 42,
-    ) -> None:
+    ) -> None:  # TODO: Change this typing
         thresholds = self.cutting_edge_thresholds(n_thresholds=n_thresh)
         metrics = {
             'threshold': [],
@@ -1104,7 +1168,7 @@ class Network:
             'task_accuracy': [],
             'n_edges': [],
         }
-        for t in thresholds[::-1]:
+        for i, t in enumerate(thresholds[::-1][:-1]):  # Please change this
             self.update_graph(cutting_threshold=t)
             self.eval()
             self.sheaf_plot(
@@ -1114,14 +1178,39 @@ class Network:
                 threshold=t,
                 seed=seed,
             )
+            if i == 0:
+                current = Path('.')
+                results = current / 'results'
+                self.save_graphs(
+                    path=results,
+                )
             metrics['threshold'] += [float(t)] * self.n_agents
             metrics['n_edges'] += [self.n_edges] * self.n_agents
             metrics['task_accuracy'] += (
-                self.return_network_performance()
+                self.return_network_acc()
             )  # returns a list
             metrics['agent_id'] += list(self.agents.keys())
 
         threshold_study(run=self.run, data=metrics)
+        return self.layout, self.threshold
+
+    def save_graphs(
+        self,
+        path,
+    ) -> None:
+        path = path / 'graphs.pkl'
+
+        if not path.exists():
+            data = []
+        else:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+
+        data.append(self)
+
+        with open(path, 'wb') as f:
+            pickle.dump(data, f)
+
         return None
 
     def restriction_maps_heatmap(
@@ -1192,6 +1281,24 @@ class Network:
         plt.title('Global dict atoms cross-correlation')
         plt.tight_layout()
         self.run.log({'global_dict_correlation': Image(plot)})
+        plt.close()
+        return None
+
+    def latents_patterns_heatmap(self) -> None:
+        latent_norms = torch.vstack(
+            [
+                torch.norm(agent.X_train, p=2, dim=1)
+                for agent in self.agents.values()
+            ]
+        )
+        agent_names = [agent.model_name for agent in self.agents.values()]
+        sns.heatmap(
+            latent_norms,
+            yticklabels=agent_names,
+            cmap='jet',
+        ).set(xticks=[])
+        plt.tight_layout()
+        self.run.log({'latent_patterns': Image(plt)})
         plt.close()
         return None
 

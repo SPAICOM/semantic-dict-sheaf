@@ -388,7 +388,7 @@ def random_stiefel(
     return torch.from_numpy(res.astype(np.float32))
 
 
-def n_atoms(S: torch.Tensor, threshold: float = 1e-5) -> int:
+def n_atoms(S: torch.Tensor, threshold: float = 1e-2) -> int:
     """
     Returns the number of atoms selected by the sparse representation rows,
     i.e., the number of rows in the matrix that have a non-zero norm.
@@ -674,6 +674,25 @@ def convert_output(fn):
     return wrapper
 
 
+def keep_topk(A, k):
+    """
+    A: 2D numpy array (m x n)
+    k: number of rows (by L2 norm) to keep. Others are set to zero.
+    Returns: B with same shape and same row order as A.
+    """
+    A = np.asarray(A)
+    m, _ = A.shape
+
+    norms = norm(A, ord=2, axis=1)
+    topk_idx = np.argsort(norms)[-k:]
+    mask = np.zeros(m, dtype=bool)
+    mask[topk_idx] = True
+    B = A.copy()
+    B[~mask, :] = 0.0
+
+    return B
+
+
 @convert_output
 def create_proto(
     X: torch.Tensor,
@@ -727,7 +746,7 @@ def convert_input(
 def save_sheaf_plt(fn):
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
-        fn(self, *args, **kwargs)
+        out = fn(self, *args, **kwargs)
         path = os.path.join(os.getcwd(), 'plot')
         if not os.path.exists(path):
             os.makedirs(path)
@@ -739,7 +758,7 @@ def save_sheaf_plt(fn):
         plt.savefig(save_path)
         print(f'Graph plot saved to {save_path}')
         plt.close()
-        return None
+        return out
 
     return wrapper
 
@@ -808,6 +827,13 @@ def main() -> None:
     print('Performing eight test...', end='\t')
     awgn(sigma=sigma, size=x.shape)
     print('[PASSED]')
+
+    print()
+    print('Performing ninth test...', end='\t')
+    res = keep_topk(np.array([[1, 2], [3, 4], [0, 0], [5, 5]]), k=2)
+    true_res = np.array([[0.0, 0.0], [3.0, 4.0], [0.0, 0.0], [5.0, 5.0]])
+    if np.all(res == true_res):
+        print('[PASSED]')
 
     return None
 

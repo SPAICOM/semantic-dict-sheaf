@@ -15,7 +15,7 @@ from hydra.core.hydra_config import HydraConfig
 
 sys.path.append(str(Path(sys.path[0]).parent))
 
-from utils import save_metrics
+from utils import save_metrics, update_metrics, save_graphs
 from src import EdgeProblemProcrustes, Network
 
 try:
@@ -40,8 +40,8 @@ def main(cfg) -> None:
     coder_params = OmegaConf.to_container(cfg.coder, resolve=True)
     agents_info: dict[int, dict[str, Any]] = {}
     models = OmegaConf.to_container(cfg.network.models, resolve=True)
-    n_edges = cfg.alignment.n_edges
-    params = OmegaConf.to_container(cfg.alignment, resolve=True)
+    # n_edges = cfg.alignment.n_edges
+    alignment_params = OmegaConf.to_container(cfg.alignment, resolve=True)
     align_problem = cfg.alignment.problem
     wandb_config = OmegaConf.to_container(
         cfg, resolve=True, throw_on_missing=True
@@ -59,16 +59,17 @@ def main(cfg) -> None:
     else:
         name = (
             f'dict_type_{coder_params["dict_type"]}_'
-            + f'atoms_{coder_params["n_atoms"]}_'
-            + f'dict_init_{coder_params["init_mode_dict"]}_'
-            + f'sreg_{coder_params["sparse_regularizer"]}_'
-            + f'dreg_{coder_params["dict_regularizer"]}_'
+            # + f'atoms_{coder_params["n_atoms"]}_'
+            # + f'dict_init_{coder_params["init_mode_dict"]}_'
+            # + f'sreg_{coder_params["sparse_regularizer"]}_'
+            + f'sparsity_{coder_params["sparsity"]}_'
+            # + f'dreg_{coder_params["dict_regularizer"]}_'
             + f'subsample_{coder_params["n_subsampling"]}_'
-            + f'subsample_{coder_params["subsampling_strategy"]}_'
+            # + f'subsample_{coder_params["subsampling_strategy"]}_'
             # + f'initD_{coder_params["init_mode_dict"]}_'
             # + f'momentum_{coder_params["momentum_D"]}_'
             # + f'stepS{coder_params["Sstep"]}_'
-            + f'stepD{coder_params["Dstep"]}_'
+            # + f'stepD{coder_params["Dstep"]}_'
             # + f'Diter{coder_params["D_iters"]}_'
             + f'maxiter{coder_params["max_iter"]}_'
             f'job{hc.job.num}' + f'{rcode}'
@@ -91,10 +92,12 @@ def main(cfg) -> None:
             'model': model_name,
             'dataset': model[model_name][0],
             'seed': model[model_name][1],
+            'regularizer': model[model_name][2],
         }
     net = Network(
         agents_info=agents_info,
         coder_params=coder_params,
+        device=cfg.device,
         run=run,
     )
     print('[Passed]')
@@ -113,7 +116,7 @@ def main(cfg) -> None:
         for edge in tqdm(list(net.edges.values())):
             prob = EdgeProblemProcrustes(
                 edge=edge,
-                params=params,
+                params=alignment_params,
                 run=run,
             )
 
@@ -126,17 +129,18 @@ def main(cfg) -> None:
     # ================================================================
     print('Starting maps evaluation...', end='\t')
     if cfg.visualization.threshold_study:
-        net.persistent_eval(
+        layout, threshold = net.persistent_eval(
+            n_thresh=cfg.visualization.n_thresh,
             n_clusters=cfg.visualization.nclusters,
             layout=cfg.visualization.layout,
         )
     else:
-        net.update_graph(n_edges=n_edges)
+        net.update_graph(n_edges=cfg.alignment.n_edges)
         net.eval()
-        net.sheaf_plot(
+        layout, threshold = net.sheaf_plot(
             n_clusters=cfg.visualization.nclusters,
             layout=cfg.visualization.layout,
-            n_thresh=cfg.visualization.n_thresh,
+            threshold=cfg.visualization.threshold,
         )
 
     if cfg.visualization.plot_restriction_maps:
@@ -145,8 +149,54 @@ def main(cfg) -> None:
         net.pca_correlation_heatmap(20, cfg.alignment.n_edges)
     if cfg.visualization.plot_global_dict_corr:
         net.global_dict_corr_heatmap()
+
+    # net.latents_patterns_heatmap()
+    # current_accuracy, current_loss = net.return_network_performance()
+
     wandb.finish()
     print('[Passed]')
+
+    # ================================================================
+    #              Compare with No Dict Learning Sheaf
+    # ================================================================
+    if cfg.compare_without_dictionary:
+        coder_params['dict_type'] = None
+        alignment_params['projected'] = False
+        name = f'nodict_job{hc.job.num}' + f'{rcode}'
+        print(f'Comparing with sheaf learning wo dictionary... \nRun: {name}')
+
+        run = wandb.init(
+            project=cfg.wandb.project,
+            name=name,
+            id=name,
+            group=cfg.simulation,
+            config=wandb_config,
+        )
+
+        no_dict_net = Network(
+            agents_info=agents_info,
+            coder_params=coder_params,
+            device=cfg.device,
+            run=run,
+        )
+
+        for edge in tqdm(list(no_dict_net.edges.values())):
+            prob = EdgeProblemProcrustes(
+                edge=edge,
+                params=alignment_params,
+                run=run,
+            )
+
+            prob.fit()
+
+        no_dict_net.update_graph(n_edges=net.n_edges)
+        no_dict_net.eval()
+        no_dict_net.sheaf_plot(
+            n_clusters=None,
+            layout=layout,
+            threshold=threshold,
+        )
+        wandb.finish()
 
     if cfg.save_results:
         # ================================================================
@@ -172,10 +222,19 @@ def main(cfg) -> None:
             dict_type=cfg.coder.dict_type,
             res_path=RESULTS,
         )
-    return None
+        # update_metrics(
+        #     res_path=RESULTS,
+        #     n_proto=cfg.coder.n_subsampling,
+        #     current_accuracy=current_accuracy,
+        #     current_loss=current_loss,
+        # )
+
+        # save_graphs(
+        #     path=RESULTS,
+        #     graph=net,
+        #     graph_nodict=no_dict_net,
+        # )
 
 
 if __name__ == '__main__':
-    style_path = Path('..') / '.conf' / 'plotting' / 'plt.mplstyle'
-    print(f'Plotting pathhhhhhhh: {style_path}')
     main()
