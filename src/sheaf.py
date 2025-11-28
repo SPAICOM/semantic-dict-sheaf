@@ -839,6 +839,7 @@ class Network:
     def eval(
         self,
         verbose: bool = False,
+        tracking: bool = True,
     ) -> None:
         """ """
         for i, agent in self.agents.items():
@@ -848,7 +849,7 @@ class Network:
                     f'Agent-{i} ({agent.model_name}) - Task Accuracy (Test): {acc}'
                 )
                 print(f'Agent-{i} ({agent.model_name}) - Loss (Test): {loss}')
-            if self.run is not None:
+            if (self.run is not None) and (tracking):
                 self.run.log(
                     {
                         f'Agent-{i} ({agent.model_name}) - Task Accuracy (Test)': acc,
@@ -935,7 +936,8 @@ class Network:
         with_labels: bool = True,
         n_clusters: int = None,
         seed: int = 42,
-        threshold: int = None,
+        n_edges: int = None,
+        threshold: float = None,
     ):  # TODO: change output type
         """Plot the sheaf with a slim right colorbar, node numbers inside nodes, and a table below.
         Also save a second version of the image without the table.
@@ -1122,8 +1124,9 @@ class Network:
         log_name = (
             f'final_network_thresh{round(threshold, 3)}'
             if threshold is not None
-            else 'final_network'
+            else f'final_network_edge{n_edges}'
         )
+        print(f'Saving {log_name}')
 
         # plt.tight_layout(pad=1.0)
 
@@ -1155,43 +1158,76 @@ class Network:
 
     def persistent_eval(
         self,
-        n_thresh: int = 20,
+        n_thresh: int = None,
         layout: str = None,
         with_labels: bool = True,
         n_clusters: int = None,
         seed: int = 42,
+        path: Path = None,
     ) -> None:  # TODO: Change this typing
-        thresholds = self.cutting_edge_thresholds(n_thresholds=n_thresh)
-        metrics = {
-            'threshold': [],
-            'agent_id': [],
-            'task_accuracy': [],
-            'n_edges': [],
-        }
-        for i, t in enumerate(thresholds[::-1][:-1]):  # Please change this
-            self.update_graph(cutting_threshold=t)
-            self.eval()
-            self.sheaf_plot(
-                layout=layout,
-                with_labels=with_labels,
-                n_clusters=n_clusters,
-                threshold=t,
-                seed=seed,
-            )
-            if i == 0:
-                current = Path('.')
-                results = current / 'results'
-                self.save_graphs(
-                    path=results,
+        if n_thresh is not None:
+            thresholds = self.cutting_edge_thresholds(n_thresholds=n_thresh)
+            metrics = {
+                'threshold': [],
+                'agent_id': [],
+                'task_accuracy': [],
+                'n_edges': [],
+            }
+            for i, t in enumerate(thresholds[::-1]):
+                self.update_graph(cutting_threshold=t)
+                self.eval(tracking=False)
+                self.sheaf_plot(
+                    layout=layout,
+                    with_labels=with_labels,
+                    n_clusters=n_clusters,
+                    threshold=t,
+                    seed=seed,
                 )
-            metrics['threshold'] += [float(t)] * self.n_agents
-            metrics['n_edges'] += [self.n_edges] * self.n_agents
-            metrics['task_accuracy'] += (
-                self.return_network_acc()
-            )  # returns a list
-            metrics['agent_id'] += list(self.agents.keys())
+                if i == 0:
+                    current = Path('.')
+                    results = current / 'results'
+                    self.save_graphs(
+                        path=results,
+                    )
+                metrics['threshold'] += [float(t)] * self.n_agents
+                metrics['n_edges'] += [self.n_edges] * self.n_agents
+                metrics['task_accuracy'] += (
+                    self.return_network_acc()
+                )  # returns a list
+                metrics['agent_id'] += list(self.agents.keys())
 
-        threshold_study(run=self.run, data=metrics)
+            threshold_study(run=self.run, data=metrics)
+        else:
+            print('Studying the avg. acc. for different n. of edges!')
+            metrics = {
+                'n_edges': [],
+                'accuracy': [],
+                'sparsity': [],
+            }
+            max_n_edges = self.n_agents * (self.n_agents - 1) / 2
+            n_edges = np.flip(np.arange(15, max_n_edges + 1, dtype=int))
+            print(n_edges)
+            for i, n in enumerate(n_edges):
+                self.update_graph(n_edges=n)
+                self.eval(tracking=False)
+                self.sheaf_plot(
+                    layout=layout,
+                    with_labels=with_labels,
+                    n_clusters=n_clusters,
+                    n_edges=n,
+                    seed=seed,
+                )
+                if i == 0:
+                    current = Path('.')
+                    results = current / 'results'
+                    self.save_graphs(
+                        path=results,
+                    )
+                metrics['n_edges'].append(n)
+                metrics['accuracy'].append(self.return_network_acc())
+                metrics['sparsity'].append(self.agents[0].sparsity)
+            with open(path / 'n_edge_study.pkl', 'wb') as f:
+                pickle.dump(metrics, f)
         return self.layout, self.threshold
 
     def save_graphs(

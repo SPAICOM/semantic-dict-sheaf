@@ -128,7 +128,7 @@ def main(cfg) -> None:
     #                        Evaluation
     # ================================================================
     print('Starting maps evaluation...', end='\t')
-    if cfg.visualization.threshold_study:
+    if cfg.visualization.persistent_study:
         layout, threshold = net.persistent_eval(
             n_thresh=cfg.visualization.n_thresh,
             n_clusters=cfg.visualization.nclusters,

@@ -66,7 +66,7 @@ coder:
   init_mode_sparse: random
   sparse_regularizer: null
   n_atoms: null
-  max_iter: 2000 # 3000
+  max_iter: 1 # 3000
   tol: 1e-2
   patience: 30
   hard_thresh: true
@@ -79,7 +79,7 @@ coder:
   Sstep: 0.3
 
 visualization:
-  threshold_study: false
+  persistent_study: true
   n_thresh: null
   threshold: null # 0.816, 0.75
   plot_restriction_maps: false

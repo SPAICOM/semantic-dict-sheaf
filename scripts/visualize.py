@@ -18,7 +18,7 @@ style_path = base_dir / '.conf' / 'plotting' / 'plt.mplstyle'
 plt.style.use(style_path.resolve())
 
 
-def read_files(setup: str, study: str) -> pl.DataFrame:
+def read_files(study: str) -> pl.DataFrame:
     folder = (
         Path.cwd().parent / 'results'
         if Path.cwd().name == 'scripts'
@@ -33,8 +33,6 @@ def read_files(setup: str, study: str) -> pl.DataFrame:
             )
         df = pl.read_parquet(proto_path, low_memory=True)
         return df
-
-    # pattern = re.compile(rf'{study}_metrics_{setup}_(\d+\.?\d*)_')
 
     dfs = pl.read_parquet(folder / f'{study}*')
     if study == 'alignment':
@@ -54,8 +52,8 @@ def read_files(setup: str, study: str) -> pl.DataFrame:
             dfs.sort('alignment_loss', descending=False)
             .group_by('sparsity', maintain_order=True)
             .agg(
-                pl.col('alignment_loss').head(20),
-                pl.col('edge_id').head(20),
+                pl.col('alignment_loss'),
+                pl.col('edge_id'),
             )
             .explode('alignment_loss', 'edge_id')
             .with_columns(
@@ -65,47 +63,8 @@ def read_files(setup: str, study: str) -> pl.DataFrame:
                 .alias('nature')
             )
         )
-    # dfs = []
-
-    # schemas = {}
-    # files = sorted(folder.glob(f'{study}_metrics_*_*.parquet'))
-    # for f in files:
-    #     df = pl.read_parquet(f, low_memory=True)
-    #     schemas[f.name] = dict(zip(df.columns, df.dtypes))
-
-    # # Build a map: column -> dtype -> [files]
-    # col_dtype_files = defaultdict(lambda: defaultdict(list))
-    # for fname, sch in schemas.items():
-    #     for col, dtype in sch.items():
-    #         col_dtype_files[col][dtype].append(fname)
-
-    # # Print only columns that have >1 dtype across files
-    # has_conflicts = False
-    # for col, dtype_map in col_dtype_files.items():
-    #     if len(dtype_map) > 1:
-    #         has_conflicts = True
-
-    # if not has_conflicts:
-    #     print('No dtype conflicts found across files.')
-
-    # print(folder.glob(f'{study}_metrics_{setup}_*.parquet'))
-    # for file in folder.glob(f'{study}_metrics_{setup}_*.parquet'):
-    #     match = pattern.search(file.stem)
-    #     if match:
-    #         print(file)
-    #         df = pl.read_parquet(file)
-    #         print(df.columns)
-    #         if 'lambda' in df.columns:
-    #             df = df.with_columns(pl.col('lambda').cast(pl.Float64))
-    #         dfs.append(df)
-
-    # # Concatenate all dataframes into one
-    # if dfs:
-    #     final_df = pl.concat(dfs, how='vertical')
-    #     print(final_df)
-    # else:
-    #     print(f'No files found matching the pattern in {folder}.')
-    #     final_df = pl.DataFrame()
+    elif study == 'dict':
+        dfs = dfs.with_columns(pl.col('degree').list.get(1))
 
     print(dfs)
 
@@ -357,7 +316,92 @@ def plot_accuracy_and_edge_loss(
     plt.show()
 
 
-# === NEW: joint sparsity plots for dict + alignment ===
+def acc_sparsity_plot(
+    dict_df: pl.DataFrame,
+    figsize: tuple[int, int] = (16, 8),
+) -> None:
+    """
+    Create two plots:
+
+    - Left:  sparsity vs acc      for each agent (from dict_df)
+    - Right: sparsity vs alignment_loss for each edge (from align_df)
+    """
+    # --- dict side: sparsity vs acc per agent ---
+    dict_pdf = dict_df.to_pandas()
+
+    # ensure numeric sparsity & acc
+    if 'sparsity' not in dict_pdf.columns or 'acc' not in dict_pdf.columns:
+        raise ValueError("dict_df must contain 'sparsity' and 'acc' columns.")
+
+    dict_pdf['sparsity'] = pd.to_numeric(dict_pdf['sparsity'], errors='coerce')
+    dict_pdf['acc'] = pd.to_numeric(dict_pdf['acc'], errors='coerce')
+
+    if 'agent_id' in dict_pdf.columns:
+        dict_pdf['agent_id'] = dict_pdf['agent_id'].astype('category')
+
+    # sort for nicer lines
+    sort_cols = (
+        ['agent_id', 'sparsity']
+        if 'agent_id' in dict_pdf.columns
+        else ['sparsity']
+    )
+    dict_pdf = dict_pdf.sort_values(sort_cols)
+
+    # --- plotting ---
+    fig, axes = plt.subplots(1, 2, figsize=figsize, sharex=False)
+
+    # Left: sparsity vs acc per agent
+    sns.lineplot(
+        data=dict_pdf,
+        x='sparsity',
+        y='acc',
+        hue='agent_id' if 'agent_id' in dict_pdf.columns else None,
+        style='agent_id' if 'agent_id' in dict_pdf.columns else None,
+        markers=True,
+        ax=axes[0],
+    )
+    axes[0].set_xlabel('Sparsity')
+    axes[0].set_ylabel('Accuracy')
+    axes[0].grid(True, axis='y')
+    if 'agent_id' in dict_pdf.columns:
+        axes[0].legend(title='Agent', loc='best')
+    else:
+        axes[0].legend_.remove()
+
+    # Right: sparsity vs alignment_loss per edge
+    sns.lineplot(
+        data=dict_df,
+        x='sparsity',
+        y='degree',
+        hue='agent_id' if 'agent_id' in dict_pdf.columns else None,
+        style='agent_id' if 'agent_id' in dict_pdf.columns else None,
+        markers=True,
+        ax=axes[1],
+    )
+    axes[1].set_xlabel('Sparsity')
+    axes[1].set_ylabel('Degree')
+    axes[1].grid(True, axis='y')
+    if 'agent_id' in dict_pdf.columns:
+        axes[0].legend(title='Agent', loc='best')
+    else:
+        axes[0].legend_.remove()
+
+    plots_dir = (
+        Path.cwd().parent / 'plot'
+        if Path.cwd().name == 'scripts'
+        else Path.cwd() / 'plot'
+    )
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    out_path = plots_dir / 'dict_acc_plots.pdf'
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+    print(f'Saved joint sparsity figure to: {out_path}')
+    return None
+
+
 def joint_sparsity_plots(
     dict_df: pl.DataFrame,
     align_df: pl.DataFrame,
@@ -491,18 +535,20 @@ def main(cfg):
     # Note: we now read files *inside* each branch instead of once at the top,
     # so we can reuse read_files for different studies.
     if cfg.study == 'dict':
-        df = read_files(cfg.setup, 'dict')
+        df = read_files('dict')
         dict_learning_plot(df, cfg.setup)
     elif cfg.study == 'alignment':
         df = read_files(cfg.setup, 'alignment')
         alignment_plot(df)
     elif cfg.study == 'proto':
-        df = read_files(cfg.setup, 'proto')
+        df = read_files('proto')
         plot_accuracy_and_edge_loss(df)
-    # === NEW CASE: read both dict_metrics and alignment_metrics ===
+    elif cfg.study == 'dict_acc':
+        dict_df = read_files('dict')
+        acc_sparsity_plot(dict_df)
     elif cfg.study == 'dict_alignment':
-        dict_df = read_files(cfg.setup, 'dict')
-        align_df = read_files(cfg.setup, 'alignment')
+        dict_df = read_files('dict')
+        align_df = read_files('alignment')
         print(dict_df)
         print(align_df)
         joint_sparsity_plots(dict_df, align_df)
