@@ -18,4 +18,10 @@ trainer:
   log_every_n_steps: 10
     
 wandb:
-  project: semantic_network_formation_sheaves__classifier 
+  project: semantic_network_formation_sheaves__classifier
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      datamodule.rx_enc: efficientvit_b2, efficientvit_m4, efficientvit_m5, lcnet_075, levit_128, levit_128s, levit_192, levit_conv_128, levit_conv_128s, levit_conv_192, volo_d1_224, volo_d1_384, xcit_small_12_p16_224, xcit_small_12_p16_384, cait_s24_224, cait_s24_384, cait_s36_384 

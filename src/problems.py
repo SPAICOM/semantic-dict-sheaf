@@ -19,7 +19,7 @@ class EdgeProblem:
         self,
         edge: Edge,
         params: dict[Any],
-        run=None,
+        run: None,
     ):
         # ================================================================
         #                          Variables
@@ -28,7 +28,7 @@ class EdgeProblem:
         self.F_i, self.F_j = self.edge.get_restriction_maps()
         self.X_i, self.X_j, _, _ = self.edge.get_latents(
             prewhite=False,
-            scale=True,
+            scale=False,
             out='numpy',
         )
         self.S_i, self.S_j = self.edge.get_sparse_representations(out='numpy')
@@ -38,29 +38,15 @@ class EdgeProblem:
         self.Z_ij = self.edge.get_mask(out='numpy')
         self.D_i, self.D_j = self.edge.get_dictionaries(out='numpy')
         self.N = self.X_i.shape[1]
+        self.d = None if self.D_i is None else self.D_i.shape[0]
 
         # ================================================================
         #                          Parameters
         # ================================================================
-        defaults = {
-            'n_iters': 1,
-            'sparse_regularizer_head': None,  # gamma
-            'sparse_regularizer_tail': None,  # gamma
-            'lagrange_multiplier': None,  # alpha
-            'mask_regularizer': None,  # lambda_
-            'align_comm_tradeoff': None,  # beta
-            'proximal_stepsize': None,  # mu
-            'verbose': False,
+        self.params = {
+            'projected': True,
         }
-        defaults.update(params)
-        self.gamma1 = defaults['sparse_regularizer_head']
-        self.gamma2 = defaults['sparse_regularizer_tail']
-        self.alpha = defaults['lagrange_multiplier']
-        self.lambda_ = defaults['mask_regularizer']
-        self.beta = defaults['align_comm_tradeoff']
-        self.ev = defaults['explained_variance']
-        self.mu = defaults['proximal_stepsize']
-        self.n_iters = defaults['n_iters']
+        self.params.update(params)
         self.run = run
 
     # ================================================================
@@ -69,14 +55,24 @@ class EdgeProblem:
 
     def _semantic_misalignment(
         self,
-        sub_projection: bool = True,
+        normalize: bool = True,
     ):
-        if sub_projection:
+        if self.params['projected']:
             sm = norm(
                 self.F_j @ self.D_j @ self.S_j - self.D_i @ self.S_i, ord='fro'
             )
         else:
             sm = norm(self.F_j @ self.X_j - self.X_i, ord='fro')
+
+        if normalize:
+            normalizer = (
+                norm(self.D_i @ self.S_i, ord='fro')
+                if self.params['projected']
+                else norm(self.X_i, ord='fro')
+            )
+            # m, n = self.X_i.shape
+            # sm /= m * n
+            sm /= normalizer
         return sm
 
     def _sparse_reconstructions(self):
@@ -98,7 +94,7 @@ class EdgeProblem:
         self.edge.update_restriction_maps(self.F_i, self.F_j)
         self.edge.update_sparse_representations(self.S_i, self.S_j)
         self.edge.update_mask(self.Z_ij)
-        self.edge.update_loss(self.loss)
+        self.edge.update_alignment_loss(self.loss)
 
     # ================================================================
     #                      Alignment Evaluation
@@ -113,54 +109,12 @@ class EdgeProblem:
     # ================================================================
     #                 Fitting the Alignment Process
     # ================================================================
-    def fit(self):
-        """Update restriction maps solving orthogonal Procrustes problem"""
-        U, _, Vt = svd((self.cov_j @ self.cov_i.T) / self.N)
-        self.F_j = (U @ Vt).T
-        self.eval()
-        self.update_edge()
-        return None
-
-    # def eval(self) -> float:
-    #     mis = self._semantic_misalignment()
-    #     rec = self._sparse_reconstructions()
-    #     reg = self._sparse_regularizers()
-    #     self.loss = mis + rec + reg
-    #     if self.run is not None:
-    #         self.run.log(
-    #             {
-    #                 f'Training Loss edge {self.edge.id} - ev {self.ev}': self.loss
-    #             }
-    #         )
-    #     return self.loss
-
-    # def fit(
-    #     self,
-    # ) -> None:
-    #     for _ in range(self.n_iters):
-    #         # Update S_j
-    #         A_j = np.vstack([self.F_j @ self.D, self.D])
-    #         C_j = np.vstack([self.D @ self.S_i, self.X_j])
-    #         self.S_j = block_st(
-    #             self.S_j - 2 * self.mu * A_j.T @ (A_j @ self.S_j - C_j),
-    #             self.mu * self.gamma1,
-    #         )
-    #         # Update S_i
-    #         A_i = np.vstack([self.D, self.D])
-    #         C_i = np.vstack([self.F_j @ self.D @ self.S_j, self.X_i])
-    #         self.S_i = block_st(
-    #             self.S_i - 2 * self.mu * A_i.T @ (A_i @ self.S_i - C_i),
-    #             self.mu * self.gamma2,
-    #         )
-
-    #         # Update F_ji solving orthogonal Procrustes problem
-    #         U, _, V = svd(self.S_j @ self.S_i.T)
-    #         self.F_j = U @ V.T
-
-    #         self.eval()
-
+    # def fit(self):
+    #     """Update restriction maps solving orthogonal Procrustes problem"""
+    #     U, _, Vt = svd((self.cov_j @ self.cov_i.T) / self.N)
+    #     self.F_j = (U @ Vt).T
+    #     self.eval()
     #     self.update_edge()
-
     #     return None
 
 
@@ -183,12 +137,17 @@ class EdgeProblemProcrustes(EdgeProblem):
             self.run.log({f'Loss (edge {self.edge.id})': self.loss})
         return self.loss
 
+    # ================================================================
+    #                 Fitting the Alignment Process
+    # ================================================================
     def fit(self):
         """Update restriction maps solving orthogonal Procrustes problem
         on a common subspace.
         """
-        U, _, Vt = svd(
-            self.D_j @ (self.S_j @ self.S_i.T) / self.N @ self.D_i.T
+        U, _, Vt = (
+            svd(self.D_j @ (self.S_j @ self.S_i.T) / self.N @ self.D_i.T)
+            if self.params['projected']
+            else svd((self.X_j @ self.X_i.T) / self.N)
         )
         self.F_j = (U @ Vt).T
         self.eval()

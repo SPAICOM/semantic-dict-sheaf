@@ -1,24 +1,34 @@
 """"""
 
 import sys
+import os
 from pathlib import Path
 
 sys.path.append(str(Path(sys.path[0]).parent))
 
+from typing import Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+import torch
+from numpy.linalg import inv, norm, svd, slogdet
+from scipy.sparse.linalg import cg
+from sklearn.decomposition import PCA
 from sklearn.linear_model import Lasso, OrthogonalMatchingPursuit
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from numpy.linalg import norm, inv
-from scipy.sparse.linalg import cg
-from scipy.linalg import dft
-from typing import Any
-from wandb import Image
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-import torch
 
-from src.utils import convert_output, block_thresholding, colnorm, n_atoms
+from src.utils import (
+    corr_heatmap,
+    block_thresholding,
+    colnorm,
+    convert_output,
+    dct_matrix,
+    n_atoms,
+    keep_topk,
+    proximal_logdet,
+)
+from wandb import Image
 
 
 class SparseCoder:
@@ -26,6 +36,7 @@ class SparseCoder:
         self,
         X: np.ndarray,
         D: np.ndarray = None,
+        method: str = 'lasso',
         params: dict[Any] = {},
     ):
         # ================================================================
@@ -36,6 +47,7 @@ class SparseCoder:
             'sparsity_level': None,
             'hard_thresh': False,
             'regularizer': 1e-3,
+            'method': 'lasso',
             'momentum': None,
             # 'dict_type': None,
             'n_atoms': None,
@@ -50,6 +62,7 @@ class SparseCoder:
         self.alpha = defaults['regularizer']
         self.max_iter = defaults['max_iter']
         self.momentum = defaults['momentum']
+        self.method = defaults['method']
         self.step = defaults['step']
         self.tol = defaults['tol']
 
@@ -83,6 +96,7 @@ class SparseCoder:
         pca.fit(self.X.T)
         self.D = pca.components_.T
         self.S = pca.transform(self.X.T).T
+
         return None
 
     def _sparse_coding_lasso(
@@ -102,7 +116,7 @@ class SparseCoder:
                 max_iter=self.max_iter,
                 tol=self.tol,
             )
-            lasso.fit(self.D.real, self.X)
+            lasso.fit(self.D, self.X)
             self.S = lasso.coef_.T
         else:
             grad = self.D.T @ (self.D @ S - self.X)
@@ -133,7 +147,7 @@ class SparseCoder:
             fit_intercept=False,
             precompute=True,
         )
-        omp.fit(Domp.real, self.X)
+        omp.fit(Domp, self.X)
         self.S = omp.coef_.T
 
         return None
@@ -144,14 +158,16 @@ class SparseCoder:
         S: np.ndarray = None,
         delta: np.ndarray = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        if self.D is None:
+        if self.method == 'pca':
             self._set_dictionary()
+        elif self.method == 'lasso':
+            self._sparse_coding_lasso(S=S, delta=delta)
+        elif self.method == 'omp':
+            self._sparse_coding_omp()
         else:
-            # raise ValueError('Heeeeeeeeeelp')
-            if self.k0 is None:
-                self._sparse_coding_lasso(S=S, delta=delta)
-            else:
-                self._sparse_coding_omp()
+            raise ValueError(
+                f'{self.method} is not a valid sparse coding method'
+            )
         return self.D, self.S
 
 
@@ -160,28 +176,39 @@ class GlobalDict:
         self,
         X: np.ndarray,
         agents: dict[int, dict[str, Any]],
+        X_train: np.ndarray = None,
+        X_test: np.ndarray = None,
+        test_gt_dict: np.ndarray = None,
         run=None,
         n_nodes: int = 1,
         params: dict[Any] = {},
+        regularizers: list[float] = [],
     ):
         # ================================================================
         #                          Parameters
         # ================================================================
         defaults = {
-            'augmented_multiplier_dict': None,
             'augmented_multiplier_sparse': None,
+            'augmented_multiplier_dict': None,
+            'dict_regularization_type': None,
             'explained_variance': None,
+            'sparsity_tolerance': 1e-3,
+            'sparse_regularizer': None,
+            'dict_regularizer': None,
+            'best_stepsize': False,
             'sparsity_level': None,
+            'coding_method': 'lasso',
+            'sparse_descent': False,
             'hard_thresh': False,
             'init_mode_dict': 'random',
             'init_mode_sparse': 'zeros',
-            'regularizer': None,
+            'sparsity': None,
             'dict_type': None,
             'momentum_D': None,
             'momentum_S': None,
             'n_atoms': None,
             'D_iters': None,
-            'S_iters': None,
+            'S_iters': 1,
             'patience': 0,
             'max_iter': 1,
             'use_CG': False,
@@ -191,14 +218,21 @@ class GlobalDict:
             'tol': 1e-3,
         }
         defaults.update(params)
-        self.rho_dict = defaults['augmented_multiplier_dict']
+        self.dict_regularization_type = defaults['dict_regularization_type']
         self.rho_sparse = defaults['augmented_multiplier_sparse']
+        self.rho_dict = defaults['augmented_multiplier_dict']
+        self.dict_regularizer = defaults['dict_regularizer']
         self.init_mode_sparse = defaults['init_mode_sparse']
         self.init_mode_dict = defaults['init_mode_dict']
+        self.coding_method = defaults['coding_method']
+        self.best_stepsize = defaults['best_stepsize']
+        self.descent = defaults['sparse_descent']
+        self.stol = defaults['sparsity_tolerance']
         self.ev = defaults['explained_variance']
         self.dict_type = defaults['dict_type']
         self.k0 = defaults['sparsity_level']
-        self.alpha = defaults['regularizer']
+        self.sparsity = defaults['sparsity']
+        self.alpha = defaults['sparse_regularizer']
         self.momentum_D = defaults['momentum_D']
         self.momentum_S = defaults['momentum_S']
         self.max_iter = defaults['max_iter']
@@ -217,40 +251,62 @@ class GlobalDict:
         self.loss = np.inf
         self.run = run
 
+        self.regularizers = regularizers
+
         # ================================================================
         #                          Variables
         # ================================================================
         self.X = X
+        self.X_train = X_train
+        self.X_test = X_test
         self.agents = agents
         self.stalk_dim, nN = self.X.shape
+        _, nN_test = self.X_test.shape
+        _, nN_train = self.X_test.shape
         self.const = 1 / norm(self.X, ord=2) ** 2
         self.n_examples = int(nN / n_nodes)
+        self.n_test_examples = int(nN_test / n_nodes)
+        self.n_train_examples = int(nN_train / n_nodes)
         self.n_nodes = n_nodes
         self.n_atoms = (
             self.stalk_dim
             if (self.n_atoms is None) or (self.dict_type == 'local_pca')
             else self.n_atoms
         )
-        self.rho_sparse *= self.n_examples
-        self.rho_dict *= self.n_examples
+        if self.dict_type == 'learnable':
+            self.rho_sparse *= self.n_examples
+            self.rho_dict *= self.n_examples
         self.D: np.ndarray = None
         self.localS: list[np.ndarray] = None
         self.localD: list[np.ndarray] = []
+        self.localS_train: list[np.ndarray] = []
+        self.localS_test: list[np.ndarray] = []
         self._init_dictionary()
         self._init_sparse()
         self.S: np.ndarray = np.hstack(self.localS)
+        self.test_gt_dict = test_gt_dict
+
+        self.S_residual = None
+        self.D_residual = None
 
     def local_vars(
         self,
         varname: str,
         agent_idx: int,
     ) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        col = slice(
-            agent_idx * self.n_examples, (agent_idx + 1) * self.n_examples
-        )
+        if varname == 'X_train':
+            dim = self.n_train_examples
+        elif varname == 'X_test':
+            dim = self.n_test_examples
+        else:
+            dim = self.n_examples
+        col = slice(agent_idx * dim, (agent_idx + 1) * dim)
 
         if varname == 'all':
-            out = tuple(getattr(self, n)[:, col] for n in ('S', 'X', 'Z', 'U'))
+            out = tuple(
+                getattr(self, n)[:, col]
+                for n in ('S', 'X', 'Z', 'U', 'X_train', 'X_test')
+            )
         else:
             try:
                 out = getattr(self, varname)[:, col]
@@ -263,6 +319,26 @@ class GlobalDict:
     def _init_dictionary(self) -> None:
         if self.init_mode_dict == 'random':
             self.D = np.random.randn(self.stalk_dim, self.n_atoms)
+        elif self.init_mode_dict == 'fourier':
+            # assert self.n_atoms == self.stalk_dim, (
+            #     'When using Fourier dictionary init, n_atoms must be equal to stalk_dim.'
+            # )
+            assert self.n_atoms % self.stalk_dim == 0, (
+                'When using Fourier dictionary init, n_atoms must be proportional to stalk_dim.'
+            )
+            if self.n_atoms == self.stalk_dim:
+                self.D = dct_matrix(self.stalk_dim, norm='ortho')
+            elif self.n_atoms / self.stalk_dim == 2:
+                self.D = np.hstack(
+                    [
+                        dct_matrix(self.stalk_dim, norm='ortho'),
+                        np.eye(self.stalk_dim),
+                    ]
+                )
+            # elif self.n_atoms % self.stalk_dim == 3:
+            #     self.D = np.hstack([dct_matrix(self.stalk_dim, norm='ortho'), np.eye(self.stalk_dim)])
+            else:
+                raise NotImplementedError
         else:
             raise ValueError(
                 f"Unknown initialization mode '{self.init_mode_dict}'."
@@ -281,7 +357,7 @@ class GlobalDict:
                 for _ in range(self.n_nodes)
             ]
         elif self.init_mode_sparse == 'fourier':
-            self.D = dft(self.stalk_dim, scale='sqrtn').real
+            self.D = dct_matrix(self.stalk_dim, norm='ortho')
             self.S = self.D @ self.X
             self.localS = [
                 self.local_vars(varname='S', agent_idx=i)
@@ -292,71 +368,138 @@ class GlobalDict:
                 f"Unknown initialization mode '{self.init_mode_sparse}'."
             )
 
-    def row_sparsity_heatmap(self, avg: bool = False):
+    # def row_sparsity_heatmap(
+    #     self,
+    #     avg: bool = False,
+    #     ylabel: bool = False,
+    # ):
+    #     local_norms = []
+    #     agent_names = []
+    #     for i in range(self.n_nodes):
+    #         S_i = self.local_vars(varname='S', agent_idx=i)
+    #         if avg:
+    #             norms = norm(S_i, ord=2, axis=1) / self.n_examples
+    #         else:
+    #             norms = norm(S_i, ord=2, axis=1)
+    #         local_norms.append(norms.reshape(-1, 1))
+    #         agent_name = self.agents[i].model_name if ylabel else f'Agent {i}'
+    #         agent_names.append(agent_name)
+    #     local_norms = np.hstack(local_norms)
+    #     return sns.heatmap(
+    #         local_norms.T,
+    #         yticklabels=agent_names,
+    #         cmap='jet',
+    #     ).set(xticks=[], fontsize=20)
+
+    def row_sparsity_heatmap(
+        self,
+        avg: bool = False,
+        ylabel: bool = False,
+    ):
         local_norms = []
         agent_names = []
+
         for i in range(self.n_nodes):
             S_i = self.local_vars(varname='S', agent_idx=i)
             if avg:
                 norms = norm(S_i, ord=2, axis=1) / self.n_examples
             else:
                 norms = norm(S_i, ord=2, axis=1)
+
             local_norms.append(norms.reshape(-1, 1))
-            agent_names.append(self.agents[i].model_name)
+
+            agent_name = self.agents[i].model_name if ylabel else f'Agent {i}'
+            agent_names.append(agent_name)
+
+        # shape: (rows, agents)
         local_norms = np.hstack(local_norms)
-        return sns.heatmap(
+
+        ax = sns.heatmap(
             local_norms.T,
             yticklabels=agent_names,
             cmap='jet',
-        ).set(xticks=[])
-
-    def eval(
-        self,
-        dict_update: bool = False,
-        splitted: bool = False,
-    ) -> None:
-        reg_var = self.Z if splitted else self.S
-        reg = (
-            np.count_nonzero(norm(reg_var, ord=2, axis=1)) * self.alpha
-            if self.thresh
-            else self.alpha * norm(reg_var, ord=2, axis=1).sum()
         )
+
+        # Remove x-ticks
+        ax.set_xticks([])
+
+        # Set font size for tick labels
+        # ax.tick_params(axis='y', labelsize=20)
+        ax.tick_params(axis='x', labelsize=20)
+
+        return ax
+
+    def plot_dict(
+        self,
+        iteration: int,
+    ) -> None:
+        sns.heatmap(
+            self.D,
+            cmap='viridis',
+            cbar_kws={'label': 'Value'},
+        )
+        plt.xlabel('')
+        plt.ylabel('')
+        plt.xticks([])
+        plt.yticks([])
+        plt.tight_layout()
+        self.run.log(
+            {f'global_dict_step{iteration}': Image(plt)}, step=self.global_step
+        )
+        plt.close()
+        return None
+
+    def eval(self) -> None:
+        # reg_var = self.Z if self.split in ['both', 'sparse'] else self.S
+        # sparse_reg = (
+        #     np.count_nonzero(norm(reg_var, ord=2, axis=1))
+        #     if self.thresh
+        #     else norm(reg_var, ord=2, axis=1).sum()
+        # )
         mse = (norm(self.X - self.D @ self.S) ** 2) / 2
-        loss = mse + reg
-        norm_loss = self.const * loss
-        if (self.loss - loss) < self.tol:
-            self.stop_cond += 1
-        self.loss = loss
+        # loss = mse + sparse_reg
+        # norm_loss = self.const * loss
+        # if (self.loss - loss) < self.tol:
+        #     self.stop_cond += 1
+        # self.loss = loss
         self.nmse = self.const * mse
-        self.sparsity = np.count_nonzero(norm(self.S, ord=2, axis=1))
-        # if dict_update:
-        #     print(f'D update: {self.loss}')
-        # else:
-        #     print(f'S update: {self.loss}')
-        #     print(f'{self.S=}')
         if self.run is not None:
-            if dict_update:
-                self.run.log(
-                    {'Dict Learning Loss': self.loss}, step=self.global_step
+            if self.test_gt_dict is not None:
+                approx_error = (norm(self.D - self.test_gt_dict) ** 2) / (
+                    norm(self.test_gt_dict) ** 2
                 )
-            else:
                 self.run.log(
-                    {'Sparse Coding Loss': self.loss}, step=self.global_step
+                    {'Dict approx error': approx_error},
+                    step=self.global_step,
                 )
-            self.run.log({'Total loss': self.loss}, step=self.global_step)
-            self.run.log({'Norm. tot. loss': norm_loss}, step=self.global_step)
-            self.run.log({'Reconstruction error': mse}, step=self.global_step)
+                self.run.log(
+                    {'Dict_residual': self.residual},
+                    step=self.global_step,
+                )
+            # self.run.log({'Total loss': self.loss}, step=self.global_step)
+            # self.run.log({'Norm. tot. loss': norm_loss}, step=self.global_step)
+            self.run.log({'NMSE': self.nmse}, step=self.global_step)
+            if self.S_residual is not None:
+                self.run.log(
+                    {'Primal res. in S': self.S_residual},
+                    step=self.global_step,
+                )
+                self.run.log(
+                    {'Primal res. in D': self.D_residual},
+                    step=self.global_step,
+                )
             self.global_step += 1
+
         return None
 
     def compute_stepsize(
         self,
         varname: str,
-        splitted: bool = False,
+        splitted: bool = True,
     ) -> None:
         if varname == 'D':
             self.Dstep = (
-                self.S @ self.S.T + self.rho_sparse * np.eye(self.S.shape)
+                1.0 / norm(self.S, 2) ** 2 + self.rho_sparse
                 if splitted
                 else self.Dstep
             )
@@ -367,7 +510,6 @@ class GlobalDict:
 
     def _sparse_coding(
         self,
-        gd: bool = False,
         coder_params: dict[Any] = {},
     ) -> None:
         self.localS = []
@@ -380,45 +522,65 @@ class GlobalDict:
                     D=self.D,
                     params=coder_params,
                 )
-                S_i = self.local_vars(varname='S', agent_idx=i) if gd else None
+                S_i = (
+                    self.local_vars(varname='S', agent_idx=i)
+                    if self.descent
+                    else None
+                )
                 D_i, S_i = coder.fit(S=S_i, delta=delta, out='numpy')
-                delta = coder.delta if gd else 0
-                if self.D is None:
-                    self.localD.append(D_i)
-                else:
-                    self.S[
-                        :, i * self.n_examples : (i + 1) * self.n_examples
-                    ] = S_i
+                delta = coder.delta if self.descent else 0
                 self.localS.append(S_i)
-            if self.D is not None:
-                self.eval()
+                if self.dict_type == 'local_pca':
+                    self.localD.append(D_i)
+                # else:
+                #     self.S[
+                #         :, i * self.n_examples : (i + 1) * self.n_examples
+                #     ] = S_i
+                #     self.eval()
             if self.stop_cond >= self.patience:
                 break
-            else:
-                self.stop_cond = 0
+        self.S = np.hstack(self.localS)
+        self.eval()
         return None
 
     def _splitted_sparse_coding(self) -> None:
         self.localS = []
+        self.S_residual = 0
         localZ = []
         localU = []
         A = inv(self.D.T @ self.D + self.rho_sparse * np.eye(self.n_atoms))
         for i in range(self.n_nodes):
-            S_i, X_i, Z_i, U_i = self.local_vars(varname='all', agent_idx=i)
-            S_i = A @ (self.D.T @ X_i + self.rho_sparse * (Z_i - U_i))
-            Z_i = block_thresholding(
-                (S_i + U_i),
-                self.alpha / self.rho_sparse,
-                hard=self.thresh,
+            S_i_old, X_i, Z_i, U_i, _, _ = self.local_vars(
+                varname='all', agent_idx=i
             )
-            U_i += S_i - Z_i
+            S_i = A @ (self.D.T @ X_i + self.rho_sparse * (Z_i - U_i))
+            S_i += self.Sstep * (S_i - S_i_old)
+            # self.Sstep *= 1 - 0.5 * self.Sstep
+            if self.thresh:
+                assert self.sparsity is not None, (
+                    "When using hard thresholding with setting 'thresh' you have to explicitly set a value for the imposed sparsity"
+                )
+
+                Z_i = keep_topk(S_i + U_i, self.sparsity)
+            else:
+                alpha = (
+                    self.regularizers[i] if self.alpha is None else self.alpha
+                )
+                Z_i = block_thresholding(
+                    (S_i + U_i),
+                    alpha / self.rho_sparse,
+                    hard=self.thresh,
+                )
+            res = S_i - Z_i
+            self.S_residual += norm(res)
+            U_i += res
             self.localS.append(S_i)
             localZ.append(Z_i)
             localU.append(U_i)
         self.S = np.hstack(self.localS)
         self.Z = np.hstack(localZ)
         self.U = np.hstack(localU)
-        self.eval(splitted=True)
+        self.eval()
         return None
 
     def _update_dictionary(self) -> None:
@@ -429,7 +591,7 @@ class GlobalDict:
                 self.S @ self.S.T, self.S @ self.X.T, rcond=None
             )[0].T
             self.D = colnorm(self.D)
-            self.eval(dict_update=True)
+            self.eval()
         else:
             delta_D = None if self.momentum_D is None else 0
             for _ in range(self.D_iters):
@@ -441,11 +603,9 @@ class GlobalDict:
                 )
                 self.D += delta_D
                 self.D = colnorm(self.D)
-                self.eval(dict_update=True)
+                self.eval()
                 if self.stop_cond >= self.patience:
                     break
-                else:
-                    self.stop_cond = 0
         return None
 
     def cg_D_update(
@@ -453,25 +613,59 @@ class GlobalDict:
         tol=1e-5,
         maxit=200,
     ) -> None:
-        A = self.S @ self.S.T + self.rho_dict * np.eye(self.n_atoms)  # k×k SPD
-        B = self.X @ self.S.T + self.rho_dict * (self.P - self.R)  # d×k
-        # D = np.empty_like(B)
-        for r in range(B.shape[0]):  # row rms
+        A = self.S @ self.S.T + self.rho_dict * np.eye(self.n_atoms)
+        B = self.X @ self.S.T + self.rho_dict * (self.P - self.R)
+        for r in range(B.shape[0]):
             self.D[r], _ = cg(A, B[r], rtol=tol, maxiter=maxit)
         return None
 
-    def _splitted_update_dictionary(
-        self,
-        splitted_reg: bool = True,
-    ) -> None:
+    def _splitted_update_dictionary(self) -> None:
+        # Closed-form solution
         if self.D_iters is None:
-            self.D = (
-                self.X @ self.S.T + self.rho_dict * (self.P - self.R)
-            ) @ inv(self.S @ self.S.T + self.rho_dict * np.eye(self.n_atoms))
+            # D_old = self.D.copy()
+            if self.dict_regularization_type is None:
+                self.D = (
+                    self.X @ self.S.T + self.rho_dict * (self.P - self.R)
+                ) @ inv(
+                    self.S @ self.S.T + self.rho_dict * np.eye(self.n_atoms)
+                )
+            elif self.dict_regularization_type == 'logdet':
+                assert self.Dstep is not None, (
+                    'step size in D cannot be None if "logdet" regularization is used'
+                )
+                linearized_reg = (
+                    self.dict_regularizer * self.D @ inv(self.D.T @ self.D)
+                )
+                D_new = (
+                    self.X @ self.S.T
+                    + self.rho_dict * (self.P - self.R)
+                    + linearized_reg
+                ) @ inv(
+                    self.S @ self.S.T + self.rho_dict * np.eye(self.n_atoms)
+                )
+                self.D += self.Dstep * (D_new - self.D)
+                # self.Dstep *= 1 - 0.5 * self.Dstep
+                # Q, unconstrained_evals, Wt = svd(self.D)
+                # constrained_evals = proximal_logdet(
+                #     unconstrained_evals,
+                #     epsilon=0,
+                #     lam=self.dict_regularizer,
+                # )
+                # self.D = Q @ np.diag(constrained_evals) @ Wt
+            else:
+                raise NotImplementedError
+
+            # self.sca_residual = norm(self.D - D_old) ** 2
             self.P = colnorm(self.D + self.R)
-            self.R += self.D - self.P
-            self.eval(splitted=splitted_reg, dict_update=True)
+            res = self.D - self.P
+            self.R += res
+            self.D_residual = norm(res)
+            self.eval()
+
+        # Smooth descending
         else:
+            if self.best_stepsize:
+                self.compute_stepsize(varname='D', splitted=True)
             for _ in range(self.D_iters):
                 if self.use_CG:
                     self.cg_D_update()
@@ -482,11 +676,9 @@ class GlobalDict:
                     self.D -= self.Dstep * grad
                 self.P = colnorm(self.D + self.R)
                 self.R += self.D - self.P
-                self.eval(splitted=splitted_reg, dict_update=True)
+                self.eval()
                 if self.stop_cond >= self.patience:
                     break
-                else:
-                    self.stop_cond = 0
         return None
 
     @convert_output
@@ -496,10 +688,13 @@ class GlobalDict:
             min_{D,S_i}  0.5 * ||X - D @ S||_F^2  +  lambda * sum_i ||S_i^T||_{2,1}
         """
 
+        good_iters = 0
         coder_params = {
+            'method': self.coding_method,
             'explained_variance': self.ev,
             'momentum': self.momentum_S,
             'sparsity_level': self.k0,
+            'sparsity_tolerance': self.stol,
             'hard_thresh': self.thresh,
             'regularizer': self.alpha,
             'max_iter': self.max_iter,
@@ -517,11 +712,13 @@ class GlobalDict:
                 self.U = np.zeros_like(self.S)
 
             for i in range(self.max_iter):
+                # print(f'Global iteration {i + 1}/{self.max_iter}')
                 # =============================================================
                 #                    UPDATE GLOBAL DICTIONARY
                 # =============================================================
                 if self.split in ['both', 'dict']:
-                    self._splitted_update_dictionary(splitted_reg=False)
+                    self._splitted_update_dictionary()
+                    D_stop = self.D_residual < self.tol
                 else:
                     self._update_dictionary()
                 # =============================================================
@@ -529,26 +726,45 @@ class GlobalDict:
                 # =============================================================
                 if self.split in ['both', 'sparse']:
                     self._splitted_sparse_coding()
+                    S_stop = self.S_residual < self.tol
                 else:
-                    self._sparse_coding(gd=True, coder_params=coder_params)
+                    self._sparse_coding(coder_params=coder_params)
+
+                # if i % 100 == 0:
+                # corr_heatmap(self.D)
+                # self.run.log(
+                #     {f'dict_corr_step{i}': Image(plt)},
+                #     step=self.global_step,
+                # )
+                # plt.close()
+                # self.plot_dict(iteration=i)
 
                 # =============================================================
                 #                  EARLY STOPPING CRITERION
                 # =============================================================
-                if self.stop_cond >= self.patience:
+                if (self.stop_cond >= self.patience) or (D_stop and S_stop):
                     print(
                         f'Converged after {i + 1} iterations with tol={self.tol}. Loss: {self.loss}.'
                     )
                     break
                 else:
+                    good_iters += 1
+
+                if good_iters >= 20:
                     self.stop_cond = 0
 
             self.row_sparsity_heatmap()
-            plt.tight_layout()
-            # self.run.summary['agents_sparsity'] = Image(plt)
+            # plt.tight_layout()
+            path = os.path.join(os.getcwd(), 'plot')
+            if not os.path.exists(path):
+                os.makedirs(path)
+            pdf_path = os.path.join(
+                path,
+                f'Signature_sparsity_{self.sparsity}_{np.random.randint(300)}.pdf',
+            )
+            plt.savefig(pdf_path, format='pdf')
             self.run.log({'sparsity': Image(plt)}, step=self.global_step)
-            plt.clf()
-            plt.cla()
+            plt.close()
 
         # elif self.dict_type == 'learnable-sparse-splitted':
         #     # Init dual and splitting variables
@@ -570,13 +786,14 @@ class GlobalDict:
         #             self.stop_cond = 0
 
         elif self.dict_type == 'fourier':
-            self.D = dft(self.stalk_dim, scale='sqrtn')
+            self.D = dct_matrix(self.stalk_dim)
         elif self.dict_type == 'local_pca':
             assert self.S_iters == 1, (
                 'S_iters must be 1 for local PCA dictionary.'
             )
             self.D = None
-            self._sparse_coding(gd=False, coder_params=coder_params)
+            coder_params['method'] = 'pca'
+            self._sparse_coding(coder_params=coder_params)
         else:
             raise ValueError(f"Unknown dictionary type '{self.dict_type}'.")
 
@@ -585,17 +802,54 @@ class GlobalDict:
 
         return self.localD, self.localS
 
+    def get_sparse_codes(
+        self,
+        test: bool = False,
+    ) -> np.ndarray:
+        varname = 'X_test' if test else 'X_train'
+        A = inv(self.D.T @ self.D + self.rho_sparse * np.eye(self.n_atoms))
+        for i in range(self.n_nodes):
+            X_i = self.local_vars(varname=varname, agent_idx=i)
+            S_i = A @ (self.D.T @ X_i)
+            if self.thresh:
+                assert self.sparsity is not None, (
+                    "When using hard thresholding with setting 'thresh' you have to explicitly set a value for the imposed sparsity"
+                )
+                S_i = keep_topk(S_i, self.sparsity)
+            else:
+                alpha = (
+                    self.regularizers[i] if self.alpha is None else self.alpha
+                )
+                S_i = block_thresholding(
+                    S_i,
+                    alpha / self.rho_sparse,
+                    hard=self.thresh,
+                )
+            if test:
+                self.localS_test.append(S_i)
+            else:
+                self.localS_train.append(S_i)
+        return None
+
+    @convert_output
+    def test(self):
+        self.get_sparse_codes()
+        self.get_sparse_codes(test=True)
+        return self.localS_train, self.localS_test
+
     def return_metrics(self) -> dict[str, Any]:
         """Return metrics of the global dictionary."""
 
         metrics = {'agent_id': [], 'sparsity': [], 'nmse': []}
         for i in range(self.n_nodes):
-            S_i = self.local_vars(varname='S', agent_idx=i)
+            # S_i = self.local_vars(varname='S', agent_idx=i)
             X_i = self.local_vars(varname='X', agent_idx=i)
+            S_i = self.localS[i]
+            D_i = self.localD[i] if self.dict_type == 'local_pca' else self.D
             metrics['agent_id'].append(i)
             metrics['sparsity'].append(n_atoms(torch.from_numpy(S_i)))
             metrics['nmse'].append(
-                (norm(X_i - self.D @ S_i) ** 2 / 2) / self.n_examples
+                (norm(X_i - D_i @ S_i) ** 2 / 2) / norm(X_i) ** 2
             )
 
         return metrics

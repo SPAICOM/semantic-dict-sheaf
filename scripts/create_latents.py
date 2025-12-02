@@ -1,25 +1,3 @@
-# /// script
-# requires-python = ">=3.12"
-# dependencies = [
-#     "datasets",
-#     "hydra-core",
-#     "omegaconf",
-#     "pytorch-lightning",
-#     "timm",
-#     "torch",
-#     "tqdm",
-# ]
-#
-# [tool.uv.sources]
-# torch = [
-#     { index = "pytorch-cu124" },
-# ]
-#
-# [[tool.uv.index]]
-# name = "pytorch-cu124"
-# url = "https://download.pytorch.org/whl/cu124"
-# explicit = true
-# ///
 """A script to collect the needed latents."""
 
 import hydra
@@ -31,14 +9,14 @@ from omegaconf import DictConfig
 
 from datasets import load_dataset, Dataset
 
+import timm
+from timm.data import resolve_data_config
+from timm.data.transforms_factory import create_transform
+
 import torch
 from torch.nn import Module
 from torch.utils.data import DataLoader
 from pytorch_lightning import seed_everything
-
-import timm
-from timm.data import resolve_data_config
-from timm.data.transforms_factory import create_transform
 
 # =============================================================
 #

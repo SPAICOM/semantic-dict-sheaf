@@ -1,0 +1,49 @@
+seed: 42
+device: cpu
+simulation: local_pca
+save_results: True
+
+network:
+  path: toy_example
+  p_edges: 1
+  mask_restrictions: False
+  connection_graph: False
+  models:
+    - vit_small_patch16_224:
+      - cifar10
+      - 42
+    - vit_small_patch16_384:
+      - cifar10
+      - 42
+    - vit_small_patch32_224:
+      - cifar10
+      - 42
+    - vit_small_patch32_384:
+      - cifar10
+      - 42
+
+alignment:
+  problem: procrustes
+  verbose: true
+  n_edges: 6
+
+coder:
+  dict_type: local_pca
+  explained_variance: 0.9
+
+visualization:
+  plot_restriction_maps: true
+  plot_pca_correlation: true
+  plot_global_dict_corr: false
+  nclusters: null
+  layout: kamada_kawai
+
+
+wandb:
+  project: local_pca
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      coder.explained_variance: 0.5, 0.6, 0.7, 0.8, 0.9 

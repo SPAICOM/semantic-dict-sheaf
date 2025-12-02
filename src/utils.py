@@ -31,14 +31,18 @@ import math
 import torch
 import shutil
 import numpy as np
+import seaborn as sns
 from typing import Any
 import jax.numpy as jnp
 from pathlib import Path
+from scipy.fft import dct
 from functools import wraps
-from numpy.linalg import svd, norm
 import matplotlib.pyplot as plt
 from sklearn.manifold import MDS
-from pytorch_lightning import seed_everything
+from sklearn.cluster import KMeans
+from numpy.linalg import svd, norm
+from scipy.optimize import root_scalar
+# from pytorch_lightning import seed_everything
 
 # ================================================================
 #
@@ -377,14 +381,14 @@ def random_stiefel(
         Q : torch.Tensor, shape (n, p)
             A semi‐orthogonal matrix with Q.T @ Q == I_p.
     """
-    seed_everything(seed)
-    A = np.random.randn(n, p)
+    rng = np.random.default_rng(seed)
+    A = rng.standard_normal((n, p))
     U, _, Vt = svd(A, full_matrices=False)
     res = U @ Vt
     return torch.from_numpy(res.astype(np.float32))
 
 
-def n_atoms(S: torch.Tensor, threshold: float = 1e-5) -> int:
+def n_atoms(S: torch.Tensor, threshold: float = 1e-2) -> int:
     """
     Returns the number of atoms selected by the sparse representation rows,
     i.e., the number of rows in the matrix that have a non-zero norm.
@@ -396,7 +400,7 @@ def n_atoms(S: torch.Tensor, threshold: float = 1e-5) -> int:
         int: The number of rows with non-zero norm.
     """
     row_norms = torch.norm(S, p=2, dim=1)
-    print(f'Sparsity: {int(torch.sum(row_norms > threshold).item())}')
+    # print(f'Sparsity: {int(torch.sum(row_norms > threshold).item())}')
     return int(torch.sum(row_norms > threshold).item())
 
 
@@ -515,6 +519,102 @@ def layout_embedding(
     return layout, features
 
 
+def cross_cosine_similarity(A, B, k):
+    """
+    Compute the cosine similarity between the first k column vectors of two matrices.
+
+    Parameters
+    ----------
+    A : array-like of shape (n_rows, n_cols_A)
+        First matrix.
+    B : array-like of shape (n_rows, n_cols_B)
+        Second matrix. Must have the same number of rows as A.
+    k : int
+        Number of leading columns to keep from each matrix.
+
+    Returns
+    -------
+    S : np.ndarray of shape (k, k)
+        Matrix of cosine similarities where S[i, j] is the cosine similarity
+        between column i of A and column j of B (after truncation).
+
+    Notes
+    -----
+    - If a column is the all-zeros vector, its similarities are set to 0 to avoid
+      division-by-zero issues.
+    """
+    A = np.asarray(A, dtype=float)
+    B = np.asarray(B, dtype=float)
+
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError('A and B must be 2D arrays.')
+    if A.shape[0] != B.shape[0]:
+        raise ValueError('A and B must have the same number of rows.')
+    if not isinstance(k, int | np.integer) or k <= 0:
+        raise ValueError('k must be a positive integer.')
+    if k > A.shape[1] or k > B.shape[1]:
+        raise ValueError(
+            f'k={k} exceeds the number of columns in A ({A.shape[1]}) or B ({B.shape[1]}).'
+        )
+
+    Ak = A[:, :k]  # keep all rows, first k columns
+    Bk = B[:, :k]
+
+    # Column norms
+    nA = np.linalg.norm(Ak, axis=0)
+    nB = np.linalg.norm(Bk, axis=0)
+
+    # Normalize safely (avoid divide-by-zero)
+    Ak_unit = Ak / np.where(nA == 0, 1, nA)
+    Bk_unit = Bk / np.where(nB == 0, 1, nB)
+
+    # Cosine similarities = dot of unit vectors
+    S = Ak_unit.T @ Bk_unit
+
+    # If any column was zero, set corresponding similarities to 0
+    zero_mask = (nA == 0)[:, None] | (nB == 0)[None, :]
+    S[zero_mask] = 0.0
+
+    return S
+
+
+def corr_heatmap(matrix: np.ndarray):
+    corr = np.corrcoef(matrix, rowvar=False)
+    plot = sns.heatmap(
+        corr,
+        cmap='viridis',
+    )
+    return plot
+
+
+def dct_matrix(N, norm='ortho'):
+    dct_dict = dct(np.eye(N), type=2, norm=norm, axis=0)
+    return dct_dict
+
+
+def proximal_logdet(
+    evals: np.ndarray, epsilon: float, lam: float
+) -> np.ndarray:
+    def f(s, sigma, lam, epsilon):
+        return s - sigma - (2 * lam * s) / (s**2 + epsilon)
+
+    def df(s, sigma, lam, epsilon):
+        return 1 - (2 * lam * epsilon) / (s**2 + epsilon) ** 2
+
+    constrained_evals = []
+    for sigma in evals:
+        sol = root_scalar(
+            f,
+            fprime=df,
+            args=(sigma, lam, epsilon),
+            method='newton',
+            x0=sigma,
+        )
+        constrained_evals.append(sol.root)
+
+    return np.array(constrained_evals)
+
+
 def convert_output(fn):
     @wraps(fn)
     def wrapper(self, *args, out: str = 'torch', **kwargs):
@@ -574,6 +674,56 @@ def convert_output(fn):
     return wrapper
 
 
+def keep_topk(A, k):
+    """
+    A: 2D numpy array (m x n)
+    k: number of rows (by L2 norm) to keep. Others are set to zero.
+    Returns: B with same shape and same row order as A.
+    """
+    A = np.asarray(A)
+    m, _ = A.shape
+
+    norms = norm(A, ord=2, axis=1)
+    topk_idx = np.argsort(norms)[-k:]
+    mask = np.zeros(m, dtype=bool)
+    mask[topk_idx] = True
+    B = A.copy()
+    B[~mask, :] = 0.0
+
+    return B
+
+
+@convert_output
+def create_proto(
+    X: torch.Tensor,
+    n_proto: int,
+    seed: int = 42,
+):
+    """
+    Create prototypes using k-means clustering.
+
+    Args:
+        X : torch.Tensor
+            Input data tensor of shape (d, n), where d is the feature dimension
+            and n is the number of samples.
+        n_prototypes : int
+            The number of prototypes (clusters) to create.
+        seed : int
+            Random seed for reproducibility.
+
+    Returns:
+        torch.Tensor
+            A tensor of shape (d, n_prototypes) containing the cluster centroids.
+    """
+
+    X_np = X.T.cpu().numpy()
+    kmeans = KMeans(n_clusters=n_proto, random_state=seed)
+    kmeans.fit(X_np)
+    centroids = torch.from_numpy(kmeans.cluster_centers_.T).to(X.device)
+
+    return centroids
+
+
 def convert_input(
     x,
     device: str,
@@ -596,17 +746,19 @@ def convert_input(
 def save_sheaf_plt(fn):
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
-        fn(self, *args, **kwargs)
+        out = fn(self, *args, **kwargs)
         path = os.path.join(os.getcwd(), 'plot')
         if not os.path.exists(path):
             os.makedirs(path)
+        threshold = kwargs.get('threshold')
         save_path = os.path.join(
             path,
-            f'{self.run.name}_{self.n_edges}_edges_{self.n_agents}_nodes.png',
+            f'{self.run.name}_{self.n_edges}_edges_{self.n_agents}_nodes_{threshold}_threshold.pdf',
         )
         plt.savefig(save_path)
         print(f'Graph plot saved to {save_path}')
-        return None
+        plt.close()
+        return out
 
     return wrapper
 
@@ -675,6 +827,13 @@ def main() -> None:
     print('Performing eight test...', end='\t')
     awgn(sigma=sigma, size=x.shape)
     print('[PASSED]')
+
+    print()
+    print('Performing ninth test...', end='\t')
+    res = keep_topk(np.array([[1, 2], [3, 4], [0, 0], [5, 5]]), k=2)
+    true_res = np.array([[0.0, 0.0], [3.0, 4.0], [0.0, 0.0], [5.0, 5.0]])
+    if np.all(res == true_res):
+        print('[PASSED]')
 
     return None
 

@@ -1,6 +1,6 @@
 seed: 42
 device: cpu
-simulation: GD_dict_both_splitted
+simulation: test
 save_results: True
 
 network:
@@ -10,49 +10,35 @@ network:
   connection_graph: False
   models:
     - vit_small_patch16_224:
-      - cifar10
+      - test
       - 42
     - vit_small_patch16_384:
-      - cifar10
+      - test
       - 42
     - vit_small_patch32_224:
-      - cifar10
+      - test
       - 42
     - vit_small_patch32_384:
-      - cifar10
+      - test
       - 42
 
-alignment:
-  problem: procrustes
-  verbose: true
-  n_edges: 5
-  plotting_nclusters: 3
-
 coder:
-  subsampling: 4000
+  n_subsampling: null
+  subsampling_strategy: null
   split: both
   dict_type: learnable
   init_mode_dict: fourier
   init_mode_sparse: fourier
-  regularizer: 8e1
+  sparse_regularizer: 1e-1
   n_atoms: null
-  max_iter: 2000
+  max_iter: 3000
   tol: 1e-6
-  Dstep: 1e-5 #1e-4
-  best_stepsize: false
-  momentum: null
+  patience: 10
   hard_thresh: false
-  use_CG: false
-  D_iters: 1
-  patience: 30
   augmented_multiplier_dict: 1
   augmented_multiplier_sparse: 1
+  dict_regularizer: 1e4
+  dict_regularization_type: log_det
 
 wandb:
-  project: GD_dict_both_splitted
-
-hydra:
-  mode: MULTIRUN
-  sweeper:
-    params:
-      # coder.Dstep: 1e-7, 1e-6, 1e-5, 1e-4, 1e-3
+  project: test_semantic_network_formation

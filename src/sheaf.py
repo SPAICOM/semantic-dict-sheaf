@@ -7,35 +7,42 @@ sys.path.append(str(Path(sys.path[0]).parent))
 
 from torch.utils.data import TensorDataset, DataLoader
 from pytorch_lightning import Trainer
-from typing import Any
 from sklearn.cluster import KMeans
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib import cm, colors as mcolors
 import matplotlib.pyplot as plt
-from tqdm.auto import tqdm
-from matplotlib import cm
-import jax.numpy as jnp
-import igraph as ig
-import numpy as np
-import torch
-
-
-# import matplotlib.patches as mpatches
-
-# from matplotlib.colors import Normalize
+import seaborn as sns
 from scipy.sparse import csgraph
+from tqdm.auto import tqdm
 from wandb import Image
+import jax.numpy as jnp
+from typing import Any
+import igraph as ig
+import pandas as pd
+import numpy as np
+import pickle
+import logging
+import torch
+import os
 
 from src.utils import (
+    cross_cosine_similarity,
     layout_embedding,
     save_sheaf_plt,
     random_stiefel,
     convert_output,
     convert_input,
+    corr_heatmap,
+    create_proto,
     prewhiten,
     n_atoms,
 )
 from src.datamodules import DataModuleClassifier
 from src.coder import SparseCoder, GlobalDict
+from src.visualize import threshold_study
 from src.neural import Classifier
+
+logging.getLogger('pytorch_lightning').setLevel(logging.ERROR)
 
 
 class Agent:
@@ -47,10 +54,12 @@ class Agent:
         model: str,
         seed: int,
         dataset: str = 'cifar10',
+        regularizer: float = None,
         device: str = 'cpu',
         testing: bool = False,
         **kwargs: Any,
     ):
+        self.regularizer = regularizer
         self.device: str = device
         self.seed: int = seed
         self.id: int = id
@@ -62,6 +71,7 @@ class Agent:
         self.model: Classifier = None
         self.loss = None
         self.acc = 0.0
+        self.acc_train = 0.0
 
         # ================================================================
         #                 Agent's Latent Space and Maps
@@ -74,6 +84,8 @@ class Agent:
             self.stalk_dim = self.X_train.shape[0]
         else:
             self.latent_initialization()
+        self.S_train: torch.Tensor = None
+        self.S_test: torch.Tensor = None
         self.S: torch.Tensor = None
         self.D: torch.Tensor = None
         self.sparsity: int = None
@@ -115,18 +127,54 @@ class Agent:
         self.restriction_maps[neighbour_id] = map_value
         return None
 
-    def latent_initialization(
-        self,
-        dataset: str = 'cifar10',
-    ) -> None:
+    def latent_initialization(self) -> None:
         """ """
-        self.datamodule = DataModuleClassifier(
-            dataset=dataset, rx_enc=self.model_name
-        )
-        self.datamodule.prepare_data()
-        self.datamodule.setup()
-        self.X_train = self.datamodule.train_data.input.T
-        self.X_test = self.datamodule.test_data.input.T
+        if self.dataset == 'test':
+            latent_dim = 10
+            sparsity = 3
+            m_train = 100
+            m_test = 30
+            n_examples = m_train + m_test
+
+            def create_column_vec(row, latent_dim):
+                tmp = np.zeros(latent_dim)
+                tmp[row['idxs']] = row['non_zero_coeff']
+                return tmp
+
+            self.gt_global_dict = random_stiefel(
+                latent_dim,
+                latent_dim,
+                seed=self.seed,
+            ).to(self.device)
+            D = self.gt_global_dict
+            tmp = pd.DataFrame()
+            # tmp['K0'] = np.random.choice(
+            #     np.arange(1, latent_dim + 1), size=(n_examples), replace=True
+            # )
+            tmp['K0'] = np.full((n_examples,), sparsity)
+            tmp['idxs'] = tmp.K0.apply(
+                lambda x: np.random.choice(latent_dim, size=x, replace=False)
+            )
+            tmp['non_zero_coeff'] = tmp.K0.apply(lambda x: np.random.randn(x))
+            tmp['column_vec'] = tmp.apply(
+                lambda x: create_column_vec(x, latent_dim=latent_dim), axis=1
+            )
+            self.S_train = np.column_stack(tmp['column_vec'].values)
+
+            data = D @ self.S_train
+            self.S_train = self.S_train[:, :m_train]
+            self.S_test = self.S_train[:, m_train:]
+            self.X_train = data[:, :m_train]
+            self.X_test = data[:, m_train:]
+        else:
+            self.datamodule = DataModuleClassifier(
+                dataset=self.dataset,
+                rx_enc=self.model_name,
+            )
+            self.datamodule.prepare_data()
+            self.datamodule.setup()
+            self.X_train = self.datamodule.train_data.input.T
+            self.X_test = self.datamodule.test_data.input.T
         self.stalk_dim = self.X_train.shape[0]
         self.n_examples = self.X_train.shape[1]
         return None
@@ -141,7 +189,7 @@ class Agent:
             X=X,
             params=coder_params,
         )
-        self.D, self.S = coder.fit(out='torch')
+        self.D, self.S_train = coder.fit(out='torch')
         return None
 
     def load_model(
@@ -162,8 +210,13 @@ class Agent:
         dl = DataLoader(
             TensorDataset(data.T, self.datamodule.test_data.labels),
             batch_size=self.datamodule.batch_size,
+            # num_workers=os.cpu_count(),
         )
-        res = trainer.test(model=self.model, dataloaders=dl)
+        res = trainer.test(
+            model=self.model,
+            dataloaders=dl,
+            verbose=False,
+        )
         return res[0]['test/acc_epoch'], res[0]['test/loss_epoch']
 
     @convert_output
@@ -171,7 +224,8 @@ class Agent:
         self,
         prewhite: bool = False,
         scale: bool = False,
-        subsampling: int = None,
+        n_subsampling: int = None,
+        subsampling_strategy: str = 'random',
         test: bool = False,
         seed: int = 42,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -194,10 +248,21 @@ class Agent:
                 X_te / torch.norm(X_te, p='fro') if X_te is not None else X_te
             )
 
-        if subsampling is not None:
-            torch.manual_seed(seed)
-            X_tr = X_tr[:, torch.randperm(X_tr.size(1))]
-            X_tr = X_tr[:, :subsampling]
+        if n_subsampling is not None:
+            if subsampling_strategy == 'random':
+                torch.manual_seed(seed)
+                X_tr = X_tr[:, torch.randperm(X_tr.size(1))]
+                X_tr = X_tr[:, :n_subsampling]
+            elif subsampling_strategy == 'proto':
+                X_tr = create_proto(
+                    X_tr,
+                    n_proto=n_subsampling,
+                    out='torch',
+                )
+            else:
+                raise NotImplementedError(
+                    f'Sampling strategy {subsampling_strategy} not implemented.'
+                )
         return X_tr, X_te
 
 
@@ -220,7 +285,9 @@ class Edge:
         self.mask: torch.Tensor = (
             torch.eye(self.stalk_dim, device=self.device) if mask else None
         )
-        self.loss: float = torch.inf
+        self.task_accuracy: list[float, float] = [None, None]
+        self.task_loss: list[float, float] = [None, None]
+        self.alignment_loss: float = torch.inf
 
     # ================================================================
     #                 Edge Feature Retrieval Methods
@@ -262,7 +329,7 @@ class Edge:
             scale=scale,
             test=test,
         )
-        X_j, X_j_test = self.head.get_latent(
+        X_j, X_j_test = self.tail.get_latent(
             prewhite=prewhite,
             scale=scale,
             test=test,
@@ -332,12 +399,66 @@ class Edge:
         self.mask = convert_input(Z_ij, self.device)
         return None
 
-    def update_loss(
+    def update_alignment_loss(
         self,
         loss: float,
     ) -> None:
-        self.loss = loss
+        self.alignment_loss = loss
         return None
+
+    def update_task_performances(
+        self,
+        acc: float,
+        loss: float,
+        reverse: bool = False,
+    ) -> None:
+        if reverse:
+            self.task_accuracy[1] = acc
+            self.task_loss[1] = loss
+        else:
+            self.task_accuracy[0] = acc
+            self.task_loss[0] = loss
+        return None
+
+    # ================================================================
+    #                 Edge Metrics Retrieval Methods
+    # ================================================================
+    def return_task_accs(self) -> dict[str, float]:
+        return self.task_accuracy
+
+    def return_task_losses(self) -> dict[str, float]:
+        return self.task_loss
+
+    def return_alignment_loss(self) -> dict[str, float]:
+        return self.alignment_loss
+
+    def return_metrics(self) -> tuple[float, float, float]:
+        """Return the edge metrics."""
+        return self.task_accuracy, self.task_loss, self.alignment_loss
+
+    def evaluate_sparsity_pattern_similarity(
+        self,
+        method: str = 'cosine',
+        on_latent: bool = False,
+    ) -> float:
+        """Evaluate the similarity between the sparsity patterns of the two agents' sparse representations."""
+        representations_head = (
+            self.head.X_train if on_latent else self.head.S_train
+        )
+        representations_tail = (
+            self.tail.X_train if on_latent else self.tail.S_train
+        )
+        head_norms = torch.norm(representations_head, p=2, dim=1)
+        tail_norms = torch.norm(representations_tail, p=2, dim=1)
+        if method == 'cosine':
+            similarity = torch.nn.functional.cosine_similarity(
+                head_norms, tail_norms, dim=0
+            )
+        else:
+            raise NotImplementedError(
+                f'Similarity method {method} not implemented.'
+            )
+        return similarity.item()
 
 
 class Network:
@@ -360,20 +481,24 @@ class Network:
         self.dictionary = dictionary
         self.device: str = device
         self.global_dim: int = 0
-        # self.globalDict: torch.Tensor = None
+        self.globalDict: torch.Tensor = None
         self.n_agents: int = 0
         self.n_edges: int = 0
         self.run = run
 
         self.coder_params: dict[Any] = {
+            'dict_type': None,
             'prewhite': False,
             'scale': False,
-            'subsampling': None,
+            'n_subsampling': None,
+            'sampling_strategy': 'random',
         }
         self.coder_params.update(coder_params)
 
         # Init Agents
-        X_train = []
+        X_stack = []
+        X_train_stack = []
+        X_test_stack = []
         for idx, info in agents_info.items():
             self.agents[idx] = Agent(
                 id=idx,
@@ -381,24 +506,55 @@ class Network:
                 dataset=info['dataset'],
                 seed=info['seed'],
                 device=self.device,
+                regularizer=info['regularizer'],
                 testing=info.get('testing', False),
                 **info.get('kwargs', {}),
             )
-            X, _ = self.agents[idx].get_latent(
+            if self.coder_params['n_subsampling'] is not None:
+                X_sub, _ = self.agents[idx].get_latent(
+                    prewhite=self.coder_params['prewhite'],
+                    scale=self.coder_params['scale'],
+                    n_subsampling=self.coder_params['n_subsampling'],
+                    subsampling_strategy=self.coder_params[
+                        'sampling_strategy'
+                    ],
+                    out='numpy',
+                )
+                X_stack.append(X_sub)
+            X_train, X_test = self.agents[idx].get_latent(
+                test=True,
                 prewhite=self.coder_params['prewhite'],
                 scale=self.coder_params['scale'],
-                subsampling=self.coder_params['subsampling'],
+                n_subsampling=None,
+                subsampling_strategy=None,
                 out='numpy',
             )
-            X_train.append(X)
+            X_train_stack.append(X_train)
+            X_test_stack.append(X_test)
 
         self.n_agents = len(self.agents)
-        X_train = np.hstack(X_train)
+        X_train_stack = np.hstack(X_train_stack)
+        X_stack = X_train_stack if X_stack == [] else np.hstack(X_stack)
+        X_test_stack = np.hstack(X_test_stack)
 
-        self.set_global_dictionary(
-            X_train,
-            dict_params=self.coder_params,
-        )
+        try:
+            gt_dictionary = (
+                self.agents[0].gt_global_dict.detach().cpu().numpy()
+            )
+        except AttributeError:
+            gt_dictionary = None
+
+        if self.coder_params['dict_type'] is not None:
+            print(
+                'Learning the dictionary for projection the latent representations...'
+            )
+            self.set_global_dictionary(
+                X_stack,
+                X_train_stack,
+                X_test_stack,
+                gt_dictionary=gt_dictionary,
+                dict_params=self.coder_params,
+            )
 
         # Init Edges
         if edges_info is None:
@@ -436,28 +592,58 @@ class Network:
         self._is_connection_graph()
         del agents_info, edges_info
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # drop the wandb.Run object from the pickled state
+        state.pop('run', None)
+        return state
+
+    def __setstate__(self, state):
+        # restore state, with run set to None (or recreate later if needed)
+        self.__dict__.update(state)
+        self.run = None
+
     def set_global_dictionary(
         self,
+        X: np.ndarray,
         X_train: np.ndarray,
+        X_test: np.ndarray,
+        gt_dictionary: np.ndarray = None,
         dict_params: dict[Any] = {},
     ) -> None:
+        regularizers = self.get_agent_regularizers()
         GD = GlobalDict(
-            X=X_train,
+            X=X,
             agents=self.agents,
+            X_train=X_train,
+            X_test=X_test,
             n_nodes=self.n_agents,
+            test_gt_dict=gt_dictionary,
             params=dict_params,
             run=self.run,
+            regularizers=regularizers,
         )
         DD, SS = GD.fit(out='torch')
 
+        #########################
+        current = Path('.')
+        results = current / 'results'
+        with open(results / 'sparse_codes.pkl', 'wb') as f:
+            pickle.dump(SS, f)
+
+        SS_train, SS_test = GD.test(out='torch')
+
         for i in range(self.n_agents):
             self.agents[i].S = SS[i]
+            self.agents[i].S_train = SS_train[i]
+            self.agents[i].S_test = SS_test[i]
             self.agents[i].sparsity = n_atoms(self.agents[i].S)
-            # print(f'Agent-{i} S: {self.agents[i].S}')
             self.agents[i].D = DD[i]
 
+        # Save dictionary learning metrics: TODO
         self.dict_metrics = GD.return_metrics()
-
+        if self.coder_params['dict_type'] == 'learnable':
+            self.globalDict = DD[0]
         return None
 
     def _is_connection_graph(
@@ -479,52 +665,112 @@ class Network:
         del edge_dims, node_dims, n
         return None
 
+    def get_agent_regularizers(self):
+        return [agent.regularizer for agent in self.agents.values()]
+
+    def get_edge_losses(
+        self,
+        agent_id: int = None,
+    ) -> dict[tuple[int, int], float]:
+        """Return a dictionary with the edge ids as keys and the corresponding edge losses as values."""
+        if agent_id is None:
+            losses = {
+                edge.id: edge.return_alignment_loss()
+                for edge in self.edges.values()
+            }
+        else:
+            losses = {}
+            for edge in self.edges.values():
+                if agent_id in edge.id:
+                    losses[edge.id] = edge.return_alignment_loss()
+
+        return losses
+
+    def cutting_edge_thresholds(
+        self,
+        n_thresholds: int,
+    ) -> np.ndarray:
+        all_edge_losses = np.array(list(self.get_edge_losses().values()))
+        min_losses = []
+        max_losses = []
+        for agent in self.agents.values():
+            neighbor_losses = np.array(
+                list(self.get_edge_losses(agent_id=agent.id).values())
+            )
+            min_losses.append(np.min(neighbor_losses))
+            max_losses.append(np.max(neighbor_losses))
+
+        min_thresh = np.max(min_losses)
+        max_thresh = np.max(max_losses)
+        valid_losses = all_edge_losses[
+            (all_edge_losses >= min_thresh) & (all_edge_losses <= max_thresh)
+        ]
+
+        # Compute quantile-based thresholds
+        quantiles = np.linspace(0, 1, n_thresholds)
+        sampled_thresholds = np.quantile(valid_losses, quantiles)
+        return sampled_thresholds
+
     def update_graph(
         self,
-        n_edges: int,
+        n_edges: int = None,
+        cutting_threshold: int = None,
     ) -> None:
+        edge_losses = self.get_edge_losses()
         """Update the graph based on the edge losses."""
-        # print(self.graph.get_edgelist())
-        assert (n_edges > 0) and (n_edges <= len(self.graph.get_edgelist())), (
-            'n_edges must be a positive integer, smaller than the current number of edges in the graph.'
-        )
-
-        edge_losses = {edge.id: edge.loss for edge in self.edges.values()}
-        to_remove = list(
-            dict(sorted(edge_losses.items(), key=lambda item: item[1])).keys()
-        )[n_edges:]
+        if cutting_threshold is None:
+            if n_edges is None:
+                n_edges = int(self.n_agents * (self.n_agents - 1) / 2)
+            assert (n_edges > 0) and (
+                n_edges <= len(self.graph.get_edgelist())
+            ), (
+                'n_edges must be a positive integer, smaller than the current number of edges in the graph.'
+            )
+            to_remove = list(
+                dict(
+                    sorted(edge_losses.items(), key=lambda item: item[1])
+                ).keys()
+            )[n_edges:]
+        else:
+            to_remove = [
+                edge
+                for edge, loss in edge_losses.items()
+                if loss > cutting_threshold
+            ]
         eids = self.graph.get_eids(to_remove, directed=False, error=False)
         eids = [eid for eid in eids if eid >= 0]
         self.graph.delete_edges(eids)
-        self.n_edges = n_edges
+        self.n_edges = len(self.graph.es)
+        return None
 
-    def prepare_message(
-        self,
-        tx_id: int,
-    ) -> torch.Tensor:
-        """Prepare the message to be sent from tx_id to rx_id."""
+    # def prepare_message(
+    #     self,
+    #     tx_id: int,
+    # ) -> torch.Tensor:
+    #     """Prepare the message to be sent from tx_id to rx_id."""
 
-        _, X_te = self.agents[tx_id].get_latent(
-            prewhite=False,
-            scale=True,
-            test=True,
-            out='numpy',
-        )
-        coder = SparseCoder(
-            X=X_te,
-            dict_type='pca',
-            params=self.coder_params,
-        )
-        _, S = coder.fit(out='torch')
-        message = self.agents[tx_id].D @ S
-        return message
+    #     _, X_te = self.agents[tx_id].get_latent(
+    #         prewhite=False,
+    #         scale=True,
+    #         test=True,
+    #         out='numpy',
+    #     )
+    #     coder = SparseCoder(
+    #         X=X_te,
+    #         dict_type='pca',
+    #         params=self.coder_params,
+    #     )
+    #     _, S = coder.fit(out='torch')
+    #     message = self.agents[tx_id].D @ S
+    #     return message
 
     def send_message(
         self,
         tx_id: int,
         rx_id: int,
+        in_sample: bool = False,
     ) -> torch.Tensor:
-        """ """
+        """Send data from tx_id to rx_id through the edge connecting them."""
 
         # message = self.prepare_message(tx_id=tx_id)
 
@@ -538,151 +784,242 @@ class Network:
         # print(f'{self.agents[tx_id].restriction_maps[rx_id].shape=}')
         # print(f'{message.shape=}')
 
+        if in_sample:
+            representation = (
+                self.agents[tx_id].X_train
+                if self.agents[tx_id].D is None
+                else self.agents[tx_id].D @ self.agents[tx_id].S_train
+            )
+        else:
+            representation = (
+                self.agents[tx_id].X_test
+                if self.agents[tx_id].D is None
+                else self.agents[tx_id].D @ self.agents[tx_id].S_test
+            )
+
         message = (
             (
                 self.agents[rx_id].restriction_maps[tx_id].T
                 @ self.agents[tx_id].restriction_maps[rx_id]
-                @ self.agents[tx_id].X_test
+                @ representation
             )
             if mask is None
             else (
                 self.agents[rx_id].restriction_maps[tx_id].T
                 @ mask
                 @ self.agents[tx_id].restriction_maps[rx_id]
-                @ self.agents[tx_id].X_test
+                @ representation
             )
         )
+
         return message
+
+    def test_communication(
+        self,
+        rx_id: int,
+        tx_id: int,
+        trainer: Trainer,
+    ) -> tuple[float, float]:
+        """Evaluate accuracy and loss for a specific agent (receiver agent) using latent representations
+        from one of its neighbors (sender agent) in the inferred network sheaf. The considered latent
+        representations are aligned by the learned restriction map to the corresponding edge between the two agents.
+        """
+        # Send the latent representations
+        rx_data = self.send_message(
+            tx_id=tx_id,
+            rx_id=rx_id,
+        )
+        rx_data_train = self.send_message(
+            tx_id=tx_id,
+            rx_id=rx_id,
+            in_sample=True,
+        )
+
+        # Evaluate the receiver agent model on the received data
+        self.agents[rx_id].load_model(
+            model_path=f'models/classifiers/{self.agents[rx_id].dataset}/{self.agents[rx_id].model_name}/seed_{self.agents[rx_id].seed}.ckpt'
+        )
+        accuracy, loss = self.agents[rx_id].test_model(
+            data=rx_data,
+            trainer=trainer,
+        )
+        accuracy_train, _ = self.agents[rx_id].test_model(
+            data=rx_data_train,
+            trainer=trainer,
+        )
+
+        # Update the edge task performances
+        if (tx_id, rx_id) in self.edges:
+            edge = (tx_id, rx_id)
+            reverse = False
+        else:
+            edge = (rx_id, tx_id)
+            reverse = True
+        self.edges[edge].update_task_performances(
+            accuracy,
+            loss,
+            reverse=reverse,
+        )
+
+        return accuracy, accuracy_train, loss
 
     def test_agent_model(
         self,
         agent_id: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """ """
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Evaluate average accuracy and loss for a specific agent using latent representations
+        from its neighbors in the inferred network sheaf. The considered latent representations
+        are the ones obtained by sending messages from the neighbors to the agent,
+        aligned by the corresponding learned restriction maps.
+        """
+        device = 'gpu' if self.device in ('cuda', 'mps') else 'cpu'
         trainer: Trainer = Trainer(
             inference_mode=True,
             enable_progress_bar=False,
             logger=False,
-            accelerator=self.device,
+            accelerator=device,
         )
         losses: dict[int, float] = {}
         accuracy: dict[str, float] = {}
+        accuracy_train: dict[str, float] = {}
         neighbors: list[int] = self.graph.neighbors(agent_id)
         for rx_id in neighbors:
-            # Send the message from the input agent to one of its neighbors
-            rx_data = self.send_message(
-                tx_id=agent_id,
-                rx_id=rx_id,
-            )
-
-            self.agents[rx_id].load_model(
-                model_path=f'models/classifiers/{self.agents[rx_id].dataset}/{self.agents[rx_id].model_name}/seed_{self.agents[rx_id].seed}.ckpt'
-            )
-            acc, loss = self.agents[rx_id].test_model(
-                data=rx_data,
+            acc, acc_train, loss = self.test_communication(
+                rx_id=agent_id,
+                tx_id=rx_id,
                 trainer=trainer,
             )
             accuracy[
                 f'Agent-{rx_id} ({self.agents[rx_id].model_name}) - Task Accuracy (Test)'
             ] = acc
 
+            accuracy_train[
+                f'Agent-{rx_id} ({self.agents[rx_id].model_name}) - Task Accuracy (Train)'
+            ] = acc_train
+
             losses[
                 f'Agent-{rx_id} ({self.agents[rx_id].model_name}) - MSE loss (Test)'
             ] = loss
 
-        return torch.mean(torch.tensor(list(accuracy.values()))), torch.mean(
-            torch.tensor(list(losses.values()))
+        return (
+            torch.mean(torch.tensor(list(accuracy.values()))),
+            torch.mean(torch.tensor(list(accuracy_train.values()))),
+            torch.mean(torch.tensor(list(losses.values()))),
         )
 
     def eval(
         self,
         verbose: bool = False,
+        tracking: bool = True,
     ) -> None:
         """ """
         for i, agent in self.agents.items():
-            acc, loss = self.test_agent_model(agent_id=i)
+            acc, acc_train, loss = self.test_agent_model(agent_id=i)
             if verbose:
                 print(
                     f'Agent-{i} ({agent.model_name}) - Task Accuracy (Test): {acc}'
                 )
                 print(f'Agent-{i} ({agent.model_name}) - Loss (Test): {loss}')
-            if self.run is not None:
+            if (self.run is not None) and (tracking):
                 self.run.log(
                     {
                         f'Agent-{i} ({agent.model_name}) - Task Accuracy (Test)': acc,
                         f'Agent-{i} ({agent.model_name}) - Loss (Test)': loss,
                     }
                 )
-            agent.acc, agent.loss = (acc, loss)
+            agent.acc, agent.acc_train, agent.loss = (acc, acc_train, loss)
         return None
 
+    def return_network_acc(self) -> list:
+        return [agent.acc.item() for agent in self.agents.values()]
+
+    def return_network_performance(self) -> tuple[float, float]:
+        # avg_acc = np.mean(np.array(self.return_network_acc()))
+        # avg_misalignment = np.mean(
+        #     np.array(list(self.get_edge_losses().values()))
+        # )
+        acc = np.array(self.return_network_acc())
+        misalignment = np.array(list(self.get_edge_losses().values()))
+        return acc, misalignment
+
+    def return_alignment_metrics(self) -> dict[str, float]:
+        """Compute alignment loss for network edges.
+        Report edge-level metrics for alignment and task performance comparison.
+        """
+
+        metrics = (
+            {
+                'edge_id': [],
+                'sparsity_pattern_similarity': [],
+                'alignment_loss': [],
+                'task_accuracy': [],
+                'task_loss': [],
+                'task_accuracy_rev': [],
+                'task_loss_rev': [],
+            }
+            if self.coder_params['dict_type'] == 'learnable'
+            else {
+                'edge_id': [],
+                'alignment_loss': [],
+                'task_accuracy': [],
+                'task_loss': [],
+                'task_accuracy_rev': [],
+                'task_loss_rev': [],
+            }
+        )
+        for edge in self.edges.values():
+            metrics['edge_id'].append(edge.id)
+            if self.coder_params['dict_type'] == 'learnable':
+                metrics['sparsity_pattern_similarity'].append(
+                    edge.evaluate_sparsity_pattern_similarity()
+                )
+            metrics['alignment_loss'].append(edge.return_alignment_loss())
+            accs = edge.return_task_accs()
+            losses = edge.return_task_losses()
+            metrics['task_accuracy'].append(accs[0])
+            metrics['task_loss'].append(losses[0])
+            metrics['task_accuracy_rev'].append(accs[1])
+            metrics['task_loss_rev'].append(losses[1])
+
+        return metrics
+
+    def return_dict_metrics(self) -> dict[str, float]:
+        """Compute the dictionary metrics for each agent.
+        Report agent-level metrics for sparse coding and task performance comparison.
+        """
+        if 'acc' not in self.dict_metrics:
+            metrics = {
+                'agent_id': self.dict_metrics['agent_id'],
+                'sparsity': self.dict_metrics['sparsity'],
+                'nmse': self.dict_metrics['nmse'],
+                'acc': [],
+                'degree': list(enumerate(self.graph.degree())),
+            }
+            for agent in self.agents.values():
+                metrics['acc'].append(agent.acc)
+            self.dict_metrics = metrics
+        return self.dict_metrics
+
     # @save_sheaf_plt
-    # def sheaf_plot(
-    #     self,
-    #     layout: List[Tuple[int]] = None,
-    #     with_labels: bool = True,
-    #     n_clusters: int = 2,
-    #     seed: int = 42,
-    # ) -> None:
-    #     """Plot the sheaf as a graph."""
-
-    #     # Edge plotting distances
-    #     edge_losses = {edge.id: edge.loss for edge in self.edges.values()}
-    #     weights = []
-    #     for e in self.graph.es:
-    #         weights.append(edge_losses[tuple(sorted([e.source, e.target]))])
-    #     self.graph.es['weight'] = weights
-    #     self.graph.es['label'] = [f'{w:.2f}' for w in weights]
-
-    #     # Layout coordinates
-    #     layout, features = layout_embedding(
-    #         graph=self.graph,
-    #         layout=layout,
-    #         seed=seed,
-    #     )
-
-    #     # Nodes plotting labels
-    #     self.graph.vs['label'] = (
-    #         [
-    #             f'{agent.id}: {agent.model_name} \nAcc: {agent.acc:.2f} - Loss: {agent.loss:.2f}'
-    #             for agent in self.agents.values()
-    #         ]
-    #         if with_labels
-    #         else None
-    #     )
-
-    #     # Nodes plotting colors
-    #     kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(features)
-    #     self.graph.vs['cluster'] = kmeans.labels_
-    #     colors = cm.get_cmap('Set1', np.max(kmeans.labels_) + 1)
-    #     self.graph.vs['color'] = [colors(c) for c in self.graph.vs['cluster']]
-
-    #     _, ax = plt.subplots(figsize=(20, 20))
-    #     plt.title(f"Sheaf learned with '{self.run.name}' algorithm")
-    #     ig.plot(
-    #         self.graph,
-    #         target=ax,
-    #         layout=layout,
-    #         vertex_label=self.graph.vs['label'],
-    #         edge_label=self.graph.es['label'],
-    #         vertex_color=self.graph.vs['color'],
-    #         bbox=(300, 300),
-    #         margin=40,
-    #     )
-    #     return None
-
-    @save_sheaf_plt
     def sheaf_plot(
         self,
-        layout: list[tuple[int]] = None,
+        layout: str = None,
         with_labels: bool = True,
-        n_clusters: int = 2,
+        n_clusters: int = None,
         seed: int = 42,
-    ) -> None:
-        """Plot the sheaf with spectral clustering and custom aesthetics using igraph."""
+        n_edges: int = None,
+        threshold: float = None,
+    ):  # TODO: change output type
+        """Plot the sheaf with a slim right colorbar, node numbers inside nodes, and a table below.
+        Also save a second version of the image without the table.
+        """
 
-        # Edge weights and labels
-        edge_losses = {edge.id: edge.loss for edge in self.edges.values()}
+        # --- Edge weights & labels
+        edge_losses = self.get_edge_losses()
         weights = [
             edge_losses[tuple(sorted([e.source, e.target]))]
             for e in self.graph.es
@@ -690,93 +1027,436 @@ class Network:
         self.graph.es['weight'] = weights
         self.graph.es['label'] = [f'{w:.2f}' for w in weights]
 
-        # Layout
-        layout, _ = layout_embedding(
-            graph=self.graph, layout=layout, seed=seed
-        )
+        # --- Layout
+        if layout is None:
+            layout, _ = layout_embedding(
+                graph=self.graph, layout=layout, seed=seed
+            )
+        else:
+            if isinstance(layout, str):
+                layout = self.graph.layout(layout)
 
-        # Spectral clustering using graph Laplacian
-        n = len(self.graph.vs)
-        A = np.zeros((n, n))
-        for e in self.graph.es:
-            A[e.source, e.target] = A[e.target, e.source] = e['weight']
+        # --- Clustering in groups
+        if n_clusters is None:
+            mark_tuples, frame_colors, frame_widths = (None, None, None)
+        elif n_clusters == 'auto':
+            # --- Group nodes by model prefix
+            names = [a.model_name for a in self.agents.values()]
+            prefixes = [n.split('_')[0] for n in names]
+            unique_prefixes = sorted(set(prefixes))
 
-        L = csgraph.laplacian(A, normed=False)
-        eigvals, eigvecs = np.linalg.eigh(L)
-        X = eigvecs[:, 1 : n_clusters + 1]
-        kmeans = KMeans(n_clusters=n_clusters, random_state=seed).fit(X)
-        cluster_labels = kmeans.labels_.tolist()  # Convert to Python list
-        self.graph.vs['cluster'] = cluster_labels
+            # Build mark_groups as a list of lists (one sublist per prefix)
+            mark_groups = [
+                [i for i, p in enumerate(prefixes) if p == pref]
+                for pref in unique_prefixes
+            ]
 
-        # Node color based on accuracy, mapped to [0.5, 1.0] in RdYlGn colormap
-        accs = np.array([agent.acc for agent in self.agents.values()])
-        acc_norm = (accs - accs.min()) / (np.ptp(accs) + 1e-6)
-        acc_scaled = 0.5 + acc_norm * 0.5
+            # Use a darker / more saturated colormap (Set2 or Dark2 instead of Pastel1)
+            palette = cm.get_cmap('Set2', max(1, len(unique_prefixes)))
+
+            # Convert to RGBA with alpha=0.7 (more visible)
+            alpha = 0.7
+            mark_colors = [
+                (*palette(i)[:3], alpha) for i in range(len(unique_prefixes))
+            ]
+
+            # Combine groups and colors into tuples for igraph
+            mark_tuples = list(zip(mark_groups, mark_colors))
+
+            # --- Per-vertex borders to reinforce groups
+            border_palette = cm.get_cmap('Dark2', max(1, len(unique_prefixes)))
+            frame_colors = [
+                (*border_palette(unique_prefixes.index(p))[:3], 1.0)
+                for p in prefixes
+            ]
+            frame_widths = [2.0] * len(prefixes)
+        else:
+            raise NotImplementedError
+
+        # --- Node colors from accuracy [0,1] using RdYlGn
+        agents_list = list(
+            self.agents.values()
+        )  # assumed aligned with vertex order
+        accs = np.array([float(a.acc) for a in agents_list], dtype=float)
+        accs = np.clip(accs, 0.0, 1.0)
         cmap = cm.get_cmap('RdYlGn')
-        self.graph.vs['color'] = [cmap(a) for a in acc_scaled]
+        # Colorbar and colors normalized between 0.5 and 1.0
+        acc_norm = mcolors.Normalize(vmin=0.5, vmax=1.0)
+        self.graph.vs['color'] = [tuple(cmap(acc_norm(a))) for a in accs]
 
-        # Node size based on sparsity
-        min_size = 10
-        max_size = 40
-        sparsities = np.array(
-            [agent.sparsity for agent in self.agents.values()]
-        )
-        sparsity_min = sparsities.min()
-        sparsity_max = sparsities.max()
-        sparsity_range = sparsity_max - sparsity_min + 1e-6
-        normalized_sizes = min_size + (
-            (sparsities - sparsity_min) / sparsity_range
-        ) * (max_size - min_size)
-        self.graph.vs['size'] = normalized_sizes.tolist()
+        # --- Node sizes: sparsity → larger range so numbers fit inside nodes
+        try:
+            sparsities = np.array(
+                [float(a.sparsity) for a in agents_list], dtype=float
+            )
+        except TypeError:
+            sparsities = np.array(
+                [float(a.stalk_dim) for a in agents_list], dtype=float
+            )
+        sp_min, sp_max = np.min(sparsities), np.max(sparsities)
+        denom = (sp_max - sp_min) if (sp_max - sp_min) > 0 else 1.0
+        min_size, max_size = 40.0, 100.0  # enlarged range
+        self.graph.vs['size'] = (
+            min_size + ((sparsities - sp_min) / denom) * (max_size - min_size)
+        ).tolist()
 
-        # Edge color in greyscale (to fake alpha fading)
-        norm_weights = (np.array(weights) - min(weights)) / (
-            max(weights) - min(weights) + 1e-5
-        )
+        # --- Edge colors: lighter for weaker edges
+        w = np.asarray(weights, dtype=float)
+        norm_w = (w - w.min()) / (w.max() - w.min() + 1e-12)
         greys = cm.get_cmap('Greys')
-        self.graph.es['color'] = [
-            greys(0.3 + 0.7 * (1 / w + 1e-6)) for w in norm_weights
-        ]
+        grey_vals = 0.9 - 0.6 * norm_w
+        self.graph.es['color'] = [tuple(greys(float(v))) for v in grey_vals]
 
-        # Labels
+        # --- Vertex labels: ONLY node numbers, centered; color depends on accuracy
         if with_labels:
             self.graph.vs['label'] = [
-                f'{agent.id}: {agent.model_name}\nAcc: {agent.acc:.2f} - N. Atoms: {agent.sparsity}'
-                for agent in self.agents.values()
+                str(i) for i in range(len(self.graph.vs))
             ]
+            # White text except when 0.65 <= acc <= 0.85 -> black (for yellow-ish nodes)
+            # label_colors = [
+            #     'black' if 0.65 <= float(a) <= 0.85 else 'white' for a in accs
+            # ]
+            self.graph.vs['label_color'] = 'black'  # per-vertex attribute
+            self.graph.vs['label_dist'] = 0  # center inside nodes
         else:
             self.graph.vs['label'] = None
 
-        # Clustering groups for `mark_groups`
-        mark_groups = [[] for _ in range(n_clusters)]
-        for idx, label in enumerate(cluster_labels):
-            mark_groups[label].append(idx)
+        self.graph.vs['label_size'] = 26
+        self.graph.es['label_size'] = 26
 
-        # Plotting
-        _, ax = plt.subplots(figsize=(20, 20))
-        plt.title(f"Sheaf learned with '{self.run.name}' algorithm")
+        # ------------------------------------------------------------------
+        # FIGURE WITH TABLE (graph + table + full-height right colorbar)
+        # ------------------------------------------------------------------
+        fig = plt.figure(figsize=(16, 11))
+        gs = fig.add_gridspec(
+            nrows=2,
+            ncols=2,
+            height_ratios=[0.78, 0.22],
+            width_ratios=[
+                0.94,
+                0.06,
+            ],  # right column for colorbar spanning both rows
+            hspace=0.1,
+            wspace=0.05,
+        )
+        ax_graph = fig.add_subplot(gs[0, 0])
+        ax_table = fig.add_subplot(gs[1, 0])
 
         ig.plot(
             self.graph,
-            target=ax,
+            target=ax_graph,
             layout=layout,
-            vertex_color=self.graph.vs['color'],
-            vertex_size=self.graph.vs['size'],
+            vertex_color=self.graph.vs['color'],  # accuracy
+            vertex_size=self.graph.vs['size'],  # sparsity/dim
             vertex_label=self.graph.vs['label'],
+            vertex_frame_color=frame_colors,
+            vertex_frame_width=frame_widths,
             edge_color=self.graph.es['color'],
             edge_label=self.graph.es['label'],
-            # mark_groups=mark_groups,
-            # mark_color=[(0.8, 0.8, 0.8, 0.2)] * n_clusters,
+            mark_groups=mark_tuples,
+            backend='matplotlib',
             bbox=(300, 300),
             margin=40,
         )
-        plt.tight_layout()
-        self.run.log({'final_network': Image(plt)})
-        # self.run.summary['final_network'] = Image(plt)
 
-    def return_metrics(self) -> dict[str, float]:
-        """Compute the dictionary metrics for each agent."""
-        return self.dict_metrics
+        # --- Full-height vertical colorbar on the RIGHT of the figure
+        if n_clusters is not None:
+            sm = cm.ScalarMappable(norm=acc_norm, cmap=cmap)
+            sm.set_array([])
+            cax = fig.add_subplot(
+                gs[:, 1]
+            )  # spans both rows -> whole right side
+            cbar = fig.colorbar(sm, cax=cax, orientation='vertical')
+            cbar.set_label(
+                'Avg. Accuracy', fontsize=28, rotation=90, labelpad=10
+            )
+            cbar.set_ticks([0.5, 0.75, 1.0])
+            cbar.ax.tick_params(labelsize=26, length=3)
+            cbar.outline.set_visible(False)
+
+        # Hide graph ticks
+        ax_graph.tick_params(
+            left=False, bottom=False, labelleft=False, labelbottom=False
+        )
+
+        # --- Table below the graph
+        ax_table.axis('off')
+        rows = [
+            [i, a.model_name, int(sparsities[i]), f'{accs[i]:.2f}']
+            for i, a in enumerate(agents_list)
+        ]
+        table = ax_table.table(
+            cellText=rows,
+            colLabels=['Node', 'Model', 'Dimension', 'Accuracy'],
+            cellLoc='center',
+            colLoc='center',
+            loc='center',
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(16)
+        table.scale(1.05, 1.18)
+
+        log_name = (
+            f'final_network_thresh{round(threshold, 3)}'
+            if threshold is not None
+            else f'final_network_edge{n_edges}'
+        )
+        print(f'Saving {log_name}')
+
+        # plt.tight_layout(pad=1.0)
+
+        # ------------------------------------------------------------------
+        # LOG / SAVE BOTH FIGURES
+        # ------------------------------------------------------------------
+        # Version with table (original behavior)
+        # path = os.path.join(os.getcwd(), 'plot')
+        # if not os.path.exists(path):
+        #     os.makedirs(path)
+        # save_path = os.path.join(
+        #     path,
+        #     f'{self.run.name}_{self.n_edges}_edges_{self.n_agents}_nodes_{threshold}_threshold.pdf',
+        # )
+        # fig_graph.savefig(save_path, bbox_inches='tight')
+        self.run.log({log_name: Image(fig)})
+        plt.close()
+
+        # Version without table
+        # self.run.log({f'{log_name}_graph_only': Image(fig_graph)})
+
+        # Save layout and threshold of the last plotting call
+        try:
+            self.layout = layout.coords
+        except AttributeError:
+            self.layout = layout
+        self.threshold = threshold
+        return self.layout, self.threshold
+
+    def persistent_eval(
+        self,
+        n_thresh: int = None,
+        layout: str = None,
+        with_labels: bool = True,
+        n_clusters: int = None,
+        seed: int = 42,
+    ) -> None:  # TODO: Change this typing
+        current = Path('.')
+        results = current / 'results'
+        if n_thresh is not None:
+            thresholds = self.cutting_edge_thresholds(n_thresholds=n_thresh)
+            metrics = {
+                'threshold': [],
+                'agent_id': [],
+                'task_accuracy': [],
+                'n_edges': [],
+            }
+            for i, t in enumerate(thresholds[::-1]):
+                self.update_graph(cutting_threshold=t)
+                self.eval(tracking=False)
+                self.sheaf_plot(
+                    layout=layout,
+                    with_labels=with_labels,
+                    n_clusters=n_clusters,
+                    threshold=t,
+                    seed=seed,
+                )
+                if i == 0:
+                    self.save_graphs(
+                        path=results,
+                    )
+                metrics['threshold'] += [float(t)] * self.n_agents
+                metrics['n_edges'] += [self.n_edges] * self.n_agents
+                metrics['task_accuracy'] += (
+                    self.return_network_acc()
+                )  # returns a list
+                metrics['agent_id'] += list(self.agents.keys())
+
+            threshold_study(run=self.run, data=metrics)
+        else:
+            metrics = {
+                'n_edges': [],
+                'accuracy': [],
+                'sparsity': [],
+            }
+            max_n_edges = self.n_agents * (self.n_agents - 1) / 2
+            n_edges = np.flip(np.arange(15, max_n_edges + 1, dtype=int))
+            for i, n in enumerate(n_edges):
+                self.update_graph(n_edges=n)
+                self.eval(tracking=False)
+                self.sheaf_plot(
+                    layout=layout,
+                    with_labels=with_labels,
+                    n_clusters=n_clusters,
+                    n_edges=n,
+                    seed=seed,
+                )
+                if i == 0:
+                    self.save_graphs(
+                        path=results,
+                    )
+                metrics['n_edges'].append(n)
+                metrics['accuracy'].append(self.return_network_acc())
+                metrics['sparsity'].append(self.agents[0].sparsity)
+            with open(
+                results / f'n_edge_study{self.agents[0].sparsity}.pkl', 'wb'
+            ) as f:
+                pickle.dump(metrics, f)
+        return self.layout, self.threshold
+
+    def save_graphs(
+        self,
+        path,
+    ) -> None:
+        path = path / 'graphs.pkl'
+
+        if not path.exists():
+            data = []
+        else:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+
+        data.append(self)
+
+        with open(path, 'wb') as f:
+            pickle.dump(data, f)
+
+        return None
+
+    def restriction_maps_heatmap(
+        self,
+        n: int,
+    ) -> None:
+        """Plot the restriction maps for the best n communication edges."""
+        cols = n // 2
+        _, axes = plt.subplots(2, cols, figsize=(10, 5))
+
+        for ax, edge in zip(axes.flatten(), list(self.edges.values())):
+            _, F_j = edge.get_restriction_maps(out='numpy')
+
+            # Min–max normalize to [0, 1] per heatmap
+            mn = np.nanmin(F_j)
+            mx = np.nanmax(F_j)
+            if not np.isfinite(mn) or not np.isfinite(mx) or mx - mn == 0:
+                F_j = np.zeros_like(F_j, dtype=float)
+            else:
+                F_j = (F_j - mn) / (mx - mn)
+
+            sns.heatmap(
+                F_j,
+                ax=ax,
+                cmap='viridis',
+                cbar_kws={'label': 'Value'},
+            )
+            ax.set_xlabel('')
+            ax.set_ylabel('')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f'Restriction Map on Edge {edge.id}')
+
+        plt.tight_layout()
+        self.run.log({'restriction_maps': Image(plt)})
+        plt.close()
+        return None
+
+    def pca_correlation_heatmap(
+        self,
+        k: int,
+        n: int,
+    ) -> None:
+        """Plot the similarity of the first k principal components of two agents for the best k communication edges."""
+        cols = n // 2
+        fig, axes = plt.subplots(2, cols, figsize=(10, 5))
+        ax_list = axes.ravel()
+        for ax, edge in zip(ax_list, list(self.edges.values())):
+            D_i, D_j = edge.get_dictionaries(out='numpy')
+            Sim = cross_cosine_similarity(D_i, D_j, k)
+            sns.heatmap(
+                Sim,
+                ax=ax,
+                cmap='viridis',
+                cbar_kws={'label': 'Value'},
+            )
+            ax.set_xlabel('Principal Component')
+            ax.set_ylabel('Principal Component')
+            ax.set_title(f'PC Cosine Similarity on Edge {edge.id}')
+
+        plt.tight_layout()
+        self.run.log({'pca_correlation': Image(plt)})
+        plt.close()
+        return None
+
+    def global_dict_corr_heatmap(self) -> None:
+        plot = corr_heatmap(self.globalDict.numpy())
+        plt.title('Global dict atoms cross-correlation')
+        plt.tight_layout()
+        self.run.log({'global_dict_correlation': Image(plot)})
+        plt.close()
+        return None
+
+    def latents_patterns_heatmap(self) -> None:
+        latent_norms = torch.vstack(
+            [
+                torch.norm(agent.X_train, p=2, dim=1)
+                for agent in self.agents.values()
+            ]
+        )
+        agent_names = [agent.model_name for agent in self.agents.values()]
+        sns.heatmap(
+            latent_norms,
+            yticklabels=agent_names,
+            cmap='jet',
+        ).set(xticks=[])
+        plt.tight_layout()
+        self.run.log({'latent_patterns': Image(plt)})
+        plt.close()
+        return None
+
+    def gt_heatmaps(
+        self,
+        n: int = 4,
+    ) -> None:
+        # Groundtruth sparse representations
+        cols = n // 2
+        _, axes = plt.subplots(2, cols, figsize=(10, 5))
+        local_norms = []
+        agent_names = []
+        SS = []
+        for ax, agent in zip(axes.flatten(), list(self.agents.values())):
+            gt_global_dict = agent.gt_global_dict
+            S_i = agent.S
+            sns.heatmap(
+                S_i,
+                ax=ax,
+                cmap='viridis',
+                cbar_kws={'label': 'Value'},
+            )
+            ax.set_xlabel('')
+            ax.set_ylabel('')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f'Sparse on agent {agent.id}')
+            norms = np.linalg.norm(S_i, ord=2, axis=1)
+            local_norms.append(norms.reshape(-1, 1))
+            agent_names.append(agent.model_name)
+            SS.append(S_i)
+        plt.tight_layout()
+        self.run.log({'gt_sparse_representations': Image(plt)})
+        plt.close()
+        local_norms = np.hstack(local_norms)
+        sns.heatmap(
+            local_norms.T,
+            yticklabels=agent_names,
+            cmap='jet',
+        ).set(xticks=[])
+        plt.tight_layout()
+        self.run.log({'gt_sparsity': Image(plt)})
+        plt.close()
+        # Groundtruth global dictionary
+        plot = corr_heatmap(gt_global_dict)
+        plt.title('GT dict atoms cross-correlation')
+        plt.tight_layout()
+        self.run.log({'gt_dict': Image(plot)})
+        plt.close()
+        return None
 
 
 def main():
@@ -822,7 +1502,7 @@ def main():
         params=coder_params,
     )
     coder.fit()
-    print(f'...{coder.S.shape=}, {coder.D.shape=}...', end='\t')
+    print(f'...{coder.S_train.shape=}, {coder.D.shape=}...', end='\t')
     print('[Passed]')
 
     # =============================================================

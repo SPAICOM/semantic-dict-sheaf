@@ -55,32 +55,34 @@ alignment:
 coder:
   n_subsampling: 4000
   subsampling_strategy: proto
-  split: both
+  split: dict
   dict_type: learnable
+  coding_method: omp
+  sparse_descent: False
   init_mode_dict: fourier
   init_mode_sparse: fourier
-  sparse_regularizer: 80 # 200
+  sparsity_tolerance: 1e-3
+  sparse_regularizer: 50
   n_atoms: null
-  max_iter: 2000
+  max_iter: 1000 # 2000
   tol: 1e-6
   patience: 30
-  hard_thresh: false # false
+  hard_thresh: false
   augmented_multiplier_dict: 1
   augmented_multiplier_sparse: 1
-  dict_regularizer: null
 
 visualization:
-  plot_restriction_maps: false
+  plot_restriction_maps: true
   plot_pca_correlation: false
   plot_global_dict_corr: true
   nclusters: null
   layout: kamada_kawai
 
 wandb:
-  project: CF_both_both_splitted
+  project: CF_both_dict_splitted_sparse_omp
 
 hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      # coder.regularizer: 5, 20, 30, 40, 50, 60, 70, 80, 90
+      # coder.regularizer: 5, 20, 30, 40, 50, 60, 70, 80, 90 
