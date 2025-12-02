@@ -85,7 +85,7 @@ def main(cfg) -> None:
     # ================================================================
     #             Sheaf Generation + Dictionary Learning
     # ================================================================
-    print('Starting sheaf generation and latents sparse coding...', end='\t')
+    print('Starting sheaf generation and latents sparse coding...', end='\n')
     for i, model in enumerate(models):
         model_name = list(model.keys())[0]
         agents_info[i] = {
@@ -103,7 +103,8 @@ def main(cfg) -> None:
     print('[Passed]')
 
     print(
-        f'Sanity check on dict rank: {np.linalg.matrix_rank(net.globalDict)}'
+        f'Sanity check on dict rank: {np.linalg.matrix_rank(net.globalDict)}',
+        end='\n',
     )
 
     # ================================================================
@@ -127,7 +128,7 @@ def main(cfg) -> None:
     # ================================================================
     #                        Evaluation
     # ================================================================
-    print('Starting maps evaluation...', end='\t')
+    print('Starting maps evaluation...', end='\n')
     if cfg.visualization.persistent_study:
         layout, threshold = net.persistent_eval(
             n_thresh=cfg.visualization.n_thresh,
@@ -135,7 +136,10 @@ def main(cfg) -> None:
             layout=cfg.visualization.layout,
         )
     else:
-        net.update_graph(n_edges=cfg.alignment.n_edges)
+        net.update_graph(
+            n_edges=cfg.alignment.n_edges,
+            cutting_threshold=cfg.visualization.threshold,
+        )
         net.eval()
         layout, threshold = net.sheaf_plot(
             n_clusters=cfg.visualization.nclusters,

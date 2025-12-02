@@ -55,7 +55,7 @@ alignment:
   problem: procrustes
   projected: true
   verbose: true
-  n_edges: 15
+  n_edges: null
 
 coder:
   n_subsampling: 4000
@@ -66,11 +66,11 @@ coder:
   init_mode_sparse: random
   sparse_regularizer: null
   n_atoms: null
-  max_iter: 1 # 3000
+  max_iter: 2000 # 3000
   tol: 1e-2
   patience: 30
   hard_thresh: true
-  sparsity: 250
+  sparsity: 384
   augmented_multiplier_dict: 1
   augmented_multiplier_sparse: 1
   dict_regularizer: 1
@@ -79,9 +79,9 @@ coder:
   Sstep: 0.3
 
 visualization:
-  persistent_study: true
+  persistent_study: false
   n_thresh: null
-  threshold: null # 0.816, 0.75
+  threshold: 0.80 # 0.816, 0.75
   plot_restriction_maps: false
   plot_pca_correlation: false
   plot_global_dict_corr: false
@@ -95,7 +95,7 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      coder.sparsity: 30, 50, 100, 150, 200, 300, 384
+      # coder.sparsity: 20, 30, 50, 70, 100, 150, 200, 300, 384
       # visualization.threshold: 0.75, 0.816
       # coder.n_subsampling: 10, 20, 50, 70, 100, 200, 500, 700, 1000, 1500, 2000, 4000, 6000
       # coder.sparse_regularizer: 1e-2, 1e-1, 1, 1e1, 1e2, 3e2

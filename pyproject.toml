@@ -14,6 +14,7 @@ dependencies = [
     "matplotlib>=3.10.6",
     "numpy>=2.3.3",
     "omegaconf>=2.3.0",
+    "plotnine>=0.15.1",
     "polars>=1.33.1",
     "pyarrow>=21.0.0",
     "pytorch-lightning>=2.5.5",
@@ -41,3 +42,8 @@ extend-select = [
 quote-style = "single"
 indent-style = "space"
 docstring-code-format = true
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+]

@@ -71,6 +71,7 @@ class Agent:
         self.model: Classifier = None
         self.loss = None
         self.acc = 0.0
+        self.acc_train = 0.0
 
         # ================================================================
         #                 Agent's Latent Space and Maps
@@ -83,6 +84,8 @@ class Agent:
             self.stalk_dim = self.X_train.shape[0]
         else:
             self.latent_initialization()
+        self.S_train: torch.Tensor = None
+        self.S_test: torch.Tensor = None
         self.S: torch.Tensor = None
         self.D: torch.Tensor = None
         self.sparsity: int = None
@@ -156,11 +159,11 @@ class Agent:
             tmp['column_vec'] = tmp.apply(
                 lambda x: create_column_vec(x, latent_dim=latent_dim), axis=1
             )
-            self.S = np.column_stack(tmp['column_vec'].values)
+            self.S_train = np.column_stack(tmp['column_vec'].values)
 
-            data = D @ self.S
-            self.S_train = self.S[:, :m_train]
-            self.S_test = self.S[:, m_train:]
+            data = D @ self.S_train
+            self.S_train = self.S_train[:, :m_train]
+            self.S_test = self.S_train[:, m_train:]
             self.X_train = data[:, :m_train]
             self.X_test = data[:, m_train:]
         else:
@@ -186,7 +189,7 @@ class Agent:
             X=X,
             params=coder_params,
         )
-        self.D, self.S = coder.fit(out='torch')
+        self.D, self.S_train = coder.fit(out='torch')
         return None
 
     def load_model(
@@ -439,8 +442,12 @@ class Edge:
         on_latent: bool = False,
     ) -> float:
         """Evaluate the similarity between the sparsity patterns of the two agents' sparse representations."""
-        representations_head = self.head.X_train if on_latent else self.head.S
-        representations_tail = self.tail.X_train if on_latent else self.tail.S
+        representations_head = (
+            self.head.X_train if on_latent else self.head.S_train
+        )
+        representations_tail = (
+            self.tail.X_train if on_latent else self.tail.S_train
+        )
         head_norms = torch.norm(representations_head, p=2, dim=1)
         tail_norms = torch.norm(representations_tail, p=2, dim=1)
         if method == 'cosine':
@@ -489,7 +496,9 @@ class Network:
         self.coder_params.update(coder_params)
 
         # Init Agents
+        X_stack = []
         X_train_stack = []
+        X_test_stack = []
         for idx, info in agents_info.items():
             self.agents[idx] = Agent(
                 id=idx,
@@ -501,17 +510,32 @@ class Network:
                 testing=info.get('testing', False),
                 **info.get('kwargs', {}),
             )
-            X, _ = self.agents[idx].get_latent(
+            if self.coder_params['n_subsampling'] is not None:
+                X_sub, _ = self.agents[idx].get_latent(
+                    prewhite=self.coder_params['prewhite'],
+                    scale=self.coder_params['scale'],
+                    n_subsampling=self.coder_params['n_subsampling'],
+                    subsampling_strategy=self.coder_params[
+                        'sampling_strategy'
+                    ],
+                    out='numpy',
+                )
+                X_stack.append(X_sub)
+            X_train, X_test = self.agents[idx].get_latent(
+                test=True,
                 prewhite=self.coder_params['prewhite'],
                 scale=self.coder_params['scale'],
-                n_subsampling=self.coder_params['n_subsampling'],
-                subsampling_strategy=self.coder_params['sampling_strategy'],
+                n_subsampling=None,
+                subsampling_strategy=None,
                 out='numpy',
             )
-            X_train_stack.append(X)
+            X_train_stack.append(X_train)
+            X_test_stack.append(X_test)
 
         self.n_agents = len(self.agents)
         X_train_stack = np.hstack(X_train_stack)
+        X_stack = X_train_stack if X_stack == [] else np.hstack(X_stack)
+        X_test_stack = np.hstack(X_test_stack)
 
         try:
             gt_dictionary = (
@@ -525,7 +549,9 @@ class Network:
                 'Learning the dictionary for projection the latent representations...'
             )
             self.set_global_dictionary(
+                X_stack,
                 X_train_stack,
+                X_test_stack,
                 gt_dictionary=gt_dictionary,
                 dict_params=self.coder_params,
             )
@@ -579,14 +605,18 @@ class Network:
 
     def set_global_dictionary(
         self,
+        X: np.ndarray,
         X_train: np.ndarray,
+        X_test: np.ndarray,
         gt_dictionary: np.ndarray = None,
         dict_params: dict[Any] = {},
     ) -> None:
         regularizers = self.get_agent_regularizers()
         GD = GlobalDict(
-            X=X_train,
+            X=X,
             agents=self.agents,
+            X_train=X_train,
+            X_test=X_test,
             n_nodes=self.n_agents,
             test_gt_dict=gt_dictionary,
             params=dict_params,
@@ -595,8 +625,18 @@ class Network:
         )
         DD, SS = GD.fit(out='torch')
 
+        #########################
+        current = Path('.')
+        results = current / 'results'
+        with open(results / 'sparse_codes.pkl', 'wb') as f:
+            pickle.dump(SS, f)
+
+        SS_train, SS_test = GD.test(out='torch')
+
         for i in range(self.n_agents):
             self.agents[i].S = SS[i]
+            self.agents[i].S_train = SS_train[i]
+            self.agents[i].S_test = SS_test[i]
             self.agents[i].sparsity = n_atoms(self.agents[i].S)
             self.agents[i].D = DD[i]
 
@@ -728,6 +768,7 @@ class Network:
         self,
         tx_id: int,
         rx_id: int,
+        in_sample: bool = False,
     ) -> torch.Tensor:
         """Send data from tx_id to rx_id through the edge connecting them."""
 
@@ -743,18 +784,31 @@ class Network:
         # print(f'{self.agents[tx_id].restriction_maps[rx_id].shape=}')
         # print(f'{message.shape=}')
 
+        if in_sample:
+            representation = (
+                self.agents[tx_id].X_train
+                if self.agents[tx_id].D is None
+                else self.agents[tx_id].D @ self.agents[tx_id].S_train
+            )
+        else:
+            representation = (
+                self.agents[tx_id].X_test
+                if self.agents[tx_id].D is None
+                else self.agents[tx_id].D @ self.agents[tx_id].S_test
+            )
+
         message = (
             (
                 self.agents[rx_id].restriction_maps[tx_id].T
                 @ self.agents[tx_id].restriction_maps[rx_id]
-                @ self.agents[tx_id].X_test
+                @ representation
             )
             if mask is None
             else (
                 self.agents[rx_id].restriction_maps[tx_id].T
                 @ mask
                 @ self.agents[tx_id].restriction_maps[rx_id]
-                @ self.agents[tx_id].X_test
+                @ representation
             )
         )
 
@@ -775,12 +829,22 @@ class Network:
             tx_id=tx_id,
             rx_id=rx_id,
         )
+        rx_data_train = self.send_message(
+            tx_id=tx_id,
+            rx_id=rx_id,
+            in_sample=True,
+        )
+
         # Evaluate the receiver agent model on the received data
         self.agents[rx_id].load_model(
             model_path=f'models/classifiers/{self.agents[rx_id].dataset}/{self.agents[rx_id].model_name}/seed_{self.agents[rx_id].seed}.ckpt'
         )
         accuracy, loss = self.agents[rx_id].test_model(
             data=rx_data,
+            trainer=trainer,
+        )
+        accuracy_train, _ = self.agents[rx_id].test_model(
+            data=rx_data_train,
             trainer=trainer,
         )
 
@@ -797,12 +861,16 @@ class Network:
             reverse=reverse,
         )
 
-        return accuracy, loss
+        return accuracy, accuracy_train, loss
 
     def test_agent_model(
         self,
         agent_id: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Evaluate average accuracy and loss for a specific agent using latent representations
         from its neighbors in the inferred network sheaf. The considered latent representations
         are the ones obtained by sending messages from the neighbors to the agent,
@@ -817,9 +885,10 @@ class Network:
         )
         losses: dict[int, float] = {}
         accuracy: dict[str, float] = {}
+        accuracy_train: dict[str, float] = {}
         neighbors: list[int] = self.graph.neighbors(agent_id)
         for rx_id in neighbors:
-            acc, loss = self.test_communication(
+            acc, acc_train, loss = self.test_communication(
                 rx_id=agent_id,
                 tx_id=rx_id,
                 trainer=trainer,
@@ -828,12 +897,18 @@ class Network:
                 f'Agent-{rx_id} ({self.agents[rx_id].model_name}) - Task Accuracy (Test)'
             ] = acc
 
+            accuracy_train[
+                f'Agent-{rx_id} ({self.agents[rx_id].model_name}) - Task Accuracy (Train)'
+            ] = acc_train
+
             losses[
                 f'Agent-{rx_id} ({self.agents[rx_id].model_name}) - MSE loss (Test)'
             ] = loss
 
-        return torch.mean(torch.tensor(list(accuracy.values()))), torch.mean(
-            torch.tensor(list(losses.values()))
+        return (
+            torch.mean(torch.tensor(list(accuracy.values()))),
+            torch.mean(torch.tensor(list(accuracy_train.values()))),
+            torch.mean(torch.tensor(list(losses.values()))),
         )
 
     def eval(
@@ -843,7 +918,7 @@ class Network:
     ) -> None:
         """ """
         for i, agent in self.agents.items():
-            acc, loss = self.test_agent_model(agent_id=i)
+            acc, acc_train, loss = self.test_agent_model(agent_id=i)
             if verbose:
                 print(
                     f'Agent-{i} ({agent.model_name}) - Task Accuracy (Test): {acc}'
@@ -856,7 +931,7 @@ class Network:
                         f'Agent-{i} ({agent.model_name}) - Loss (Test)': loss,
                     }
                 )
-            agent.acc, agent.loss = (acc, loss)
+            agent.acc, agent.acc_train, agent.loss = (acc, acc_train, loss)
         return None
 
     def return_network_acc(self) -> list:
@@ -1163,8 +1238,9 @@ class Network:
         with_labels: bool = True,
         n_clusters: int = None,
         seed: int = 42,
-        path: Path = None,
     ) -> None:  # TODO: Change this typing
+        current = Path('.')
+        results = current / 'results'
         if n_thresh is not None:
             thresholds = self.cutting_edge_thresholds(n_thresholds=n_thresh)
             metrics = {
@@ -1184,8 +1260,6 @@ class Network:
                     seed=seed,
                 )
                 if i == 0:
-                    current = Path('.')
-                    results = current / 'results'
                     self.save_graphs(
                         path=results,
                     )
@@ -1198,7 +1272,6 @@ class Network:
 
             threshold_study(run=self.run, data=metrics)
         else:
-            print('Studying the avg. acc. for different n. of edges!')
             metrics = {
                 'n_edges': [],
                 'accuracy': [],
@@ -1206,7 +1279,6 @@ class Network:
             }
             max_n_edges = self.n_agents * (self.n_agents - 1) / 2
             n_edges = np.flip(np.arange(15, max_n_edges + 1, dtype=int))
-            print(n_edges)
             for i, n in enumerate(n_edges):
                 self.update_graph(n_edges=n)
                 self.eval(tracking=False)
@@ -1218,15 +1290,15 @@ class Network:
                     seed=seed,
                 )
                 if i == 0:
-                    current = Path('.')
-                    results = current / 'results'
                     self.save_graphs(
                         path=results,
                     )
                 metrics['n_edges'].append(n)
                 metrics['accuracy'].append(self.return_network_acc())
                 metrics['sparsity'].append(self.agents[0].sparsity)
-            with open(path / 'n_edge_study.pkl', 'wb') as f:
+            with open(
+                results / f'n_edge_study{self.agents[0].sparsity}.pkl', 'wb'
+            ) as f:
                 pickle.dump(metrics, f)
         return self.layout, self.threshold
 
@@ -1350,7 +1422,7 @@ class Network:
         SS = []
         for ax, agent in zip(axes.flatten(), list(self.agents.values())):
             gt_global_dict = agent.gt_global_dict
-            S_i = agent.S_train
+            S_i = agent.S
             sns.heatmap(
                 S_i,
                 ax=ax,
@@ -1430,7 +1502,7 @@ def main():
         params=coder_params,
     )
     coder.fit()
-    print(f'...{coder.S.shape=}, {coder.D.shape=}...', end='\t')
+    print(f'...{coder.S_train.shape=}, {coder.D.shape=}...', end='\t')
     print('[Passed]')
 
     # =============================================================

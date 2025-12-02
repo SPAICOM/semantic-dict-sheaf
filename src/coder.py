@@ -176,6 +176,8 @@ class GlobalDict:
         self,
         X: np.ndarray,
         agents: dict[int, dict[str, Any]],
+        X_train: np.ndarray = None,
+        X_test: np.ndarray = None,
         test_gt_dict: np.ndarray = None,
         run=None,
         n_nodes: int = 1,
@@ -255,10 +257,16 @@ class GlobalDict:
         #                          Variables
         # ================================================================
         self.X = X
+        self.X_train = X_train
+        self.X_test = X_test
         self.agents = agents
         self.stalk_dim, nN = self.X.shape
+        _, nN_test = self.X_test.shape
+        _, nN_train = self.X_test.shape
         self.const = 1 / norm(self.X, ord=2) ** 2
         self.n_examples = int(nN / n_nodes)
+        self.n_test_examples = int(nN_test / n_nodes)
+        self.n_train_examples = int(nN_train / n_nodes)
         self.n_nodes = n_nodes
         self.n_atoms = (
             self.stalk_dim
@@ -271,6 +279,8 @@ class GlobalDict:
         self.D: np.ndarray = None
         self.localS: list[np.ndarray] = None
         self.localD: list[np.ndarray] = []
+        self.localS_train: list[np.ndarray] = []
+        self.localS_test: list[np.ndarray] = []
         self._init_dictionary()
         self._init_sparse()
         self.S: np.ndarray = np.hstack(self.localS)
@@ -284,12 +294,19 @@ class GlobalDict:
         varname: str,
         agent_idx: int,
     ) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        col = slice(
-            agent_idx * self.n_examples, (agent_idx + 1) * self.n_examples
-        )
+        if varname == 'X_train':
+            dim = self.n_train_examples
+        elif varname == 'X_test':
+            dim = self.n_test_examples
+        else:
+            dim = self.n_examples
+        col = slice(agent_idx * dim, (agent_idx + 1) * dim)
 
         if varname == 'all':
-            out = tuple(getattr(self, n)[:, col] for n in ('S', 'X', 'Z', 'U'))
+            out = tuple(
+                getattr(self, n)[:, col]
+                for n in ('S', 'X', 'Z', 'U', 'X_train', 'X_test')
+            )
         else:
             try:
                 out = getattr(self, varname)[:, col]
@@ -533,7 +550,7 @@ class GlobalDict:
         localU = []
         A = inv(self.D.T @ self.D + self.rho_sparse * np.eye(self.n_atoms))
         for i in range(self.n_nodes):
-            S_i_old, X_i, Z_i, U_i = self.local_vars(
+            S_i_old, X_i, Z_i, U_i, _, _ = self.local_vars(
                 varname='all', agent_idx=i
             )
             S_i = A @ (self.D.T @ X_i + self.rho_sparse * (Z_i - U_i))
@@ -784,6 +801,41 @@ class GlobalDict:
             self.localD = [self.D for _ in range(self.n_nodes)]
 
         return self.localD, self.localS
+
+    def get_sparse_codes(
+        self,
+        test: bool = False,
+    ) -> np.ndarray:
+        varname = 'X_test' if test else 'X_train'
+        A = inv(self.D.T @ self.D + self.rho_sparse * np.eye(self.n_atoms))
+        for i in range(self.n_nodes):
+            X_i = self.local_vars(varname=varname, agent_idx=i)
+            S_i = A @ (self.D.T @ X_i)
+            if self.thresh:
+                assert self.sparsity is not None, (
+                    "When using hard thresholding with setting 'thresh' you have to explicitly set a value for the imposed sparsity"
+                )
+                S_i = keep_topk(S_i, self.sparsity)
+            else:
+                alpha = (
+                    self.regularizers[i] if self.alpha is None else self.alpha
+                )
+                S_i = block_thresholding(
+                    S_i,
+                    alpha / self.rho_sparse,
+                    hard=self.thresh,
+                )
+            if test:
+                self.localS_test.append(S_i)
+            else:
+                self.localS_train.append(S_i)
+        return None
+
+    @convert_output
+    def test(self):
+        self.get_sparse_codes()
+        self.get_sparse_codes(test=True)
+        return self.localS_train, self.localS_test
 
     def return_metrics(self) -> dict[str, Any]:
         """Return metrics of the global dictionary."""

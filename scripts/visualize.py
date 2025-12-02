@@ -7,6 +7,7 @@ from pathlib import Path
 import seaborn as sns
 from typing import Optional
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from collections import defaultdict
 
 try:
@@ -34,7 +35,7 @@ def read_files(study: str) -> pl.DataFrame:
         df = pl.read_parquet(proto_path, low_memory=True)
         return df
 
-    dfs = pl.read_parquet(folder / f'{study}*')
+    dfs = pl.read_parquet(folder / f'{study}*').fill_null(384)
     if study == 'alignment':
         homo_edges = [
             [0, 1],
@@ -62,11 +63,46 @@ def read_files(study: str) -> pl.DataFrame:
                 .otherwise(pl.lit('heterophilic'))
                 .alias('nature')
             )
+            .with_columns(
+                pl.when(pl.col('sparsity').is_null())
+                .then(pl.lit('Dictionary'))
+                .otherwise(pl.lit('No dictionary'))
+                .alias('Case')
+            )
+            .with_columns(pl.col('sparsity').fill_null(384))
         )
     elif study == 'dict':
-        dfs = dfs.with_columns(pl.col('degree').list.get(1))
+        model_map = {
+            0: 'vit_small_patch16_224',
+            1: 'vit_small_patch16_384',
+            2: 'vit_small_patch32_224',
+            3: 'vit_small_patch32_384',
+            4: 'levit_128',
+            5: 'levit_192',
+            6: 'efficientvit_m4',
+            7: 'levit_conv_128',
+            8: 'volo_d1_224',
+            9: 'volo_d1_384',
+        }
 
-    print(dfs)
+        df_models = pl.DataFrame(
+            {
+                'agent_id': list(model_map.keys()),
+                'model_name': list(model_map.values()),
+            }
+        )
+        dfs_edge = pl.read_parquet(folder / 'alignment*')
+        print(dfs_edge.columns)
+        dfs_edge = (
+            dfs_edge.filter(pl.col('alignment_loss') <= 0.76)
+            .group_by('sparsity')
+            .len()
+            .rename({'len': 'edge_count'})  # optional but helpful
+        )
+
+        dfs = dfs.join(dfs_edge, on='sparsity', how='left')
+        dfs = dfs.with_columns(pl.col('degree').list.get(1))
+        dfs = dfs.join(df_models, on='agent_id', how='left')
 
     return dfs
 
@@ -318,74 +354,143 @@ def plot_accuracy_and_edge_loss(
 
 def acc_sparsity_plot(
     dict_df: pl.DataFrame,
-    figsize: tuple[int, int] = (16, 8),
+    figsize: tuple[int, int] = (12, 8),
 ) -> None:
     """
-    Create two plots:
-
-    - Left:  sparsity vs acc      for each agent (from dict_df)
-    - Right: sparsity vs alignment_loss for each edge (from align_df)
+    Plot:
+    - sparsity vs accuracy (hue=model_family, style=agent_id) with Seaborn defaults
+    - sparsity vs number of edges (secondary Y axis)
+    - two legends inside the plot:
+        * Model Family (color)
+        * Agent Id (style)
     """
-    # --- dict side: sparsity vs acc per agent ---
     dict_pdf = dict_df.to_pandas()
 
-    # ensure numeric sparsity & acc
-    if 'sparsity' not in dict_pdf.columns or 'acc' not in dict_pdf.columns:
-        raise ValueError("dict_df must contain 'sparsity' and 'acc' columns.")
+    required = {'sparsity', 'acc', 'agent_id', 'model_name', 'edge_count'}
+    missing = required - set(dict_pdf.columns)
+    if missing:
+        raise ValueError(f'dict_df missing required columns: {missing}')
 
     dict_pdf['sparsity'] = pd.to_numeric(dict_pdf['sparsity'], errors='coerce')
     dict_pdf['acc'] = pd.to_numeric(dict_pdf['acc'], errors='coerce')
-
-    if 'agent_id' in dict_pdf.columns:
-        dict_pdf['agent_id'] = dict_pdf['agent_id'].astype('category')
-
-    # sort for nicer lines
-    sort_cols = (
-        ['agent_id', 'sparsity']
-        if 'agent_id' in dict_pdf.columns
-        else ['sparsity']
+    dict_pdf['edge_count'] = pd.to_numeric(
+        dict_pdf['edge_count'], errors='coerce'
     )
-    dict_pdf = dict_pdf.sort_values(sort_cols)
+    dict_pdf['agent_id'] = dict_pdf['agent_id'].astype('category')
 
-    # --- plotting ---
-    fig, axes = plt.subplots(1, 2, figsize=figsize, sharex=False)
+    # model_family: take prefix before first "_" and capitalize
+    dict_pdf['model_family'] = (
+        dict_pdf['model_name']
+        .astype(str)
+        .str.split('_')
+        .str[0]
+        .str.capitalize()
+    )
 
-    # Left: sparsity vs acc per agent
+    dict_pdf = dict_pdf.sort_values(['agent_id', 'sparsity'])
+
+    families = dict_pdf['model_family'].unique().tolist()
+    agents = dict_pdf['agent_id'].cat.categories.tolist()
+    agents_str = [str(a) for a in agents]  # <-- for matching legend labels
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Main Seaborn plot: let Seaborn decide markers/linestyles
     sns.lineplot(
         data=dict_pdf,
         x='sparsity',
         y='acc',
-        hue='agent_id' if 'agent_id' in dict_pdf.columns else None,
-        style='agent_id' if 'agent_id' in dict_pdf.columns else None,
+        hue='model_family',
+        # units='agent_id',
+        # estimator=None,
+        style='model_family',
         markers=True,
-        ax=axes[0],
+        dashes=False,
+        palette='tab10',  # custom palette for accuracy colors
+        ax=ax,
     )
-    axes[0].set_xlabel('Sparsity')
-    axes[0].set_ylabel('Accuracy')
-    axes[0].grid(True, axis='y')
-    if 'agent_id' in dict_pdf.columns:
-        axes[0].legend(title='Agent', loc='best')
-    else:
-        axes[0].legend_.remove()
 
-    # Right: sparsity vs alignment_loss per edge
-    sns.lineplot(
-        data=dict_df,
-        x='sparsity',
-        y='degree',
-        hue='agent_id' if 'agent_id' in dict_pdf.columns else None,
-        style='agent_id' if 'agent_id' in dict_pdf.columns else None,
-        markers=True,
-        ax=axes[1],
+    ax.set_xlabel(r'Number of selected atoms $(d^\prime)$')
+    ax.set_ylabel('Avg. Accuracy')
+    ax.grid(True, axis='y')
+
+    # Secondary Y axis: edge count (no markers)
+    ax2 = ax.twinx()
+    edges_pdf = (
+        dict_pdf[['sparsity', 'edge_count']]
+        .drop_duplicates()
+        .sort_values('sparsity')
     )
-    axes[1].set_xlabel('Sparsity')
-    axes[1].set_ylabel('Degree')
-    axes[1].grid(True, axis='y')
-    if 'agent_id' in dict_pdf.columns:
-        axes[0].legend(title='Agent', loc='best')
-    else:
-        axes[0].legend_.remove()
+    ax2.plot(
+        edges_pdf['sparsity'],
+        edges_pdf['edge_count'],
+        linestyle='--',
+        marker='d',
+        color='black',
+        linewidth=2,
+    )
+    ax2.set_ylabel('Number of edges')
 
+    # -------- split Seaborn's combined legend --------
+    handles, labels = ax.get_legend_handles_labels()
+
+    hue_handles, hue_labels = [], []
+    style_handles, style_labels = [], []
+
+    for h, lab in zip(handles, labels):
+        if lab in families:
+            hue_handles.append(h)
+            hue_labels.append(lab)
+        elif lab in agents_str:
+            style_handles.append(h)
+            style_labels.append(lab)
+
+    # Remove original combined legend
+    if ax.legend_ is not None:
+        ax.legend_.remove()
+
+    # Legend 1: Model Family (colors)
+    legend1 = ax.legend(
+        hue_handles,
+        hue_labels,
+        title='Architectural Family',
+        loc='center left',
+        bbox_to_anchor=(0.55, 0.25),  # right center
+        frameon=True,
+        ncol=2,
+    )
+    ax.add_artist(legend1)
+
+    type_handles = [
+        Line2D(
+            [0],
+            [0],
+            color='black',
+            linestyle='-',
+            marker=None,
+            markersize=6,
+            label='Agents Accuracy',
+        ),
+        Line2D(
+            [0],
+            [0],
+            color='black',
+            linestyle='--',
+            marker=None,
+            label='Number of Edges',
+        ),
+    ]
+
+    legend_types = ax.legend(
+        handles=type_handles,
+        title='Curve Types',
+        loc='center left',
+        bbox_to_anchor=(0.61, 0.45),
+        frameon=True,
+    )
+    ax.add_artist(legend_types)
+
+    # Save
     plots_dir = (
         Path.cwd().parent / 'plot'
         if Path.cwd().name == 'scripts'
@@ -403,8 +508,8 @@ def acc_sparsity_plot(
 
 
 def joint_sparsity_plots(
-    dict_df: pl.DataFrame,
     align_df: pl.DataFrame,
+    dict_df: pl.DataFrame = None,
     figsize: tuple[int, int] = (16, 8),
 ) -> None:
     """
@@ -413,26 +518,32 @@ def joint_sparsity_plots(
     - Left:  sparsity vs acc      for each agent (from dict_df)
     - Right: sparsity vs alignment_loss for each edge (from align_df)
     """
-    # --- dict side: sparsity vs acc per agent ---
-    dict_pdf = dict_df.to_pandas()
 
-    # ensure numeric sparsity & acc
-    if 'sparsity' not in dict_pdf.columns or 'acc' not in dict_pdf.columns:
-        raise ValueError("dict_df must contain 'sparsity' and 'acc' columns.")
+    if dict_df is not None:
+        # --- dict side: sparsity vs acc per agent ---
+        dict_pdf = dict_df.to_pandas()
 
-    dict_pdf['sparsity'] = pd.to_numeric(dict_pdf['sparsity'], errors='coerce')
-    dict_pdf['acc'] = pd.to_numeric(dict_pdf['acc'], errors='coerce')
+        # ensure numeric sparsity & acc
+        if 'sparsity' not in dict_pdf.columns or 'acc' not in dict_pdf.columns:
+            raise ValueError(
+                "dict_df must contain 'sparsity' and 'acc' columns."
+            )
 
-    if 'agent_id' in dict_pdf.columns:
-        dict_pdf['agent_id'] = dict_pdf['agent_id'].astype('category')
+        dict_pdf['sparsity'] = pd.to_numeric(
+            dict_pdf['sparsity'], errors='coerce'
+        )
+        dict_pdf['acc'] = pd.to_numeric(dict_pdf['acc'], errors='coerce')
 
-    # sort for nicer lines
-    sort_cols = (
-        ['agent_id', 'sparsity']
-        if 'agent_id' in dict_pdf.columns
-        else ['sparsity']
-    )
-    dict_pdf = dict_pdf.sort_values(sort_cols)
+        if 'agent_id' in dict_pdf.columns:
+            dict_pdf['agent_id'] = dict_pdf['agent_id'].astype('category')
+
+        # sort for nicer lines
+        sort_cols = (
+            ['agent_id', 'sparsity']
+            if 'agent_id' in dict_pdf.columns
+            else ['sparsity']
+        )
+        dict_pdf = dict_pdf.sort_values(sort_cols)
 
     # --- alignment side: sparsity vs alignment_loss per edge ---
     align_pdf = align_df.to_pandas()
@@ -468,25 +579,33 @@ def joint_sparsity_plots(
         align_pdf = align_pdf.sort_values(['sparsity'])
 
     # --- plotting ---
-    fig, axes = plt.subplots(1, 2, figsize=figsize, sharex=False)
-
-    # Left: sparsity vs acc per agent
-    sns.lineplot(
-        data=dict_pdf,
-        x='sparsity',
-        y='acc',
-        hue='agent_id' if 'agent_id' in dict_pdf.columns else None,
-        style='agent_id' if 'agent_id' in dict_pdf.columns else None,
-        markers=True,
-        ax=axes[0],
+    fig, axes = (
+        plt.subplots(1, 2, figsize=figsize, sharex=False)
+        if dict_df is not None
+        else plt.subplots()
     )
-    axes[0].set_xlabel('Sparsity')
-    axes[0].set_ylabel('Accuracy')
-    axes[0].grid(True, axis='y')
-    if 'agent_id' in dict_pdf.columns:
-        axes[0].legend(title='Agent', loc='best')
+
+    if dict_df is not None:
+        ax = axes[1]
+        # Left: sparsity vs acc per agent
+        sns.lineplot(
+            data=dict_pdf,
+            x='sparsity',
+            y='acc',
+            hue='agent_id' if 'agent_id' in dict_pdf.columns else None,
+            style='agent_id' if 'agent_id' in dict_pdf.columns else None,
+            markers=True,
+            ax=axes[0],
+        )
+        axes[0].set_xlabel('Sparsity')
+        axes[0].set_ylabel('Accuracy')
+        axes[0].grid(True, axis='y')
+        if 'agent_id' in dict_pdf.columns:
+            axes[0].legend(title='Agent', loc='best')
+        else:
+            axes[0].legend_.remove()
     else:
-        axes[0].legend_.remove()
+        ax = axes
 
     # Right: sparsity vs alignment_loss per edge
     sns.lineplot(
@@ -499,16 +618,17 @@ def joint_sparsity_plots(
         estimator=None,
         # style='edge_id' if 'edge_id' in align_pdf.columns else None,
         markers=True,
-        ax=axes[1],
+        ax=ax,
     )
-    axes[1].set_xlabel('Sparsity')
-    # axes[1].set_yscale('log')
-    axes[1].set_ylabel('Edge alignment loss')
-    axes[1].grid(True, axis='y')
+    ax.set_xlabel('Sparsity')
+    # ax.set_yscale('log')
+    # ax.set_xscale('log')
+    ax.set_ylabel('Edge alignment loss')
+    ax.grid(True, axis='y')
     if 'edge_id' in align_pdf.columns:
-        axes[1].legend(title='Edge', loc='best')
+        ax.legend(title='Edge', loc='best')
     else:
-        axes[1].legend_.remove()
+        ax.legend_.remove()
 
     plots_dir = (
         Path.cwd().parent / 'plot'
@@ -532,8 +652,6 @@ def joint_sparsity_plots(
     config_name='local_pca',
 )
 def main(cfg):
-    # Note: we now read files *inside* each branch instead of once at the top,
-    # so we can reuse read_files for different studies.
     if cfg.study == 'dict':
         df = read_files('dict')
         dict_learning_plot(df, cfg.setup)
@@ -547,11 +665,10 @@ def main(cfg):
         dict_df = read_files('dict')
         acc_sparsity_plot(dict_df)
     elif cfg.study == 'dict_alignment':
-        dict_df = read_files('dict')
+        # dict_df = read_files('dict')
+        dict_df = None
         align_df = read_files('alignment')
-        print(dict_df)
-        print(align_df)
-        joint_sparsity_plots(dict_df, align_df)
+        joint_sparsity_plots(align_df, dict_df)
     else:
         raise ValueError(f'Unknown study type: {cfg.study}')
 
