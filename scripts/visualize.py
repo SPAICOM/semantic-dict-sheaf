@@ -455,7 +455,8 @@ def acc_sparsity_plot(
         hue_labels,
         title='Architectural Family',
         loc='center left',
-        bbox_to_anchor=(0.55, 0.25),  # right center
+        bbox_to_anchor=(0.55, 0.25),
+        framealpha=1.0,
         frameon=True,
         ncol=2,
     )
@@ -487,6 +488,7 @@ def acc_sparsity_plot(
         loc='center left',
         bbox_to_anchor=(0.61, 0.45),
         frameon=True,
+        framealpha=1.0,
     )
     ax.add_artist(legend_types)
 
