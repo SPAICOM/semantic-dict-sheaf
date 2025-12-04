@@ -66,6 +66,22 @@ This will automatically create a virtual environment (if none exists) and instal
 
 You're ready to go! 🚀
 
+## Citation
+
+If you find this code useful for your research, please consider citing the following paper:
+
+```
+@misc{grimaldi2025learningnetworksheavesainative,
+      title={Learning Network Sheaves for AI-native Semantic Communication}, 
+      author={Enrico Grimaldi and Mario Edoardo Pandolfo and Gabriele D'Acunto and Sergio Barbarossa and Paolo Di Lorenzo},
+      year={2025},
+      eprint={2512.03248},
+      archivePrefix={arXiv},
+      primaryClass={cs.MA},
+      url={https://arxiv.org/abs/2512.03248}, 
+}
+```
+
 ## Authors
 
 - [Enrico Grimaldi](https://github.com/Engrima18)
