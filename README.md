@@ -1,5 +1,15 @@
 # Learning Network Sheaves for AI-native Semantic Communication
 
+<h5 align="center">
+     
+ 
+[![arXiv](https://img.shields.io/badge/Arxiv-2512.03248-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2512.03248)
+[![License](https://img.shields.io/badge/Code%20License-MIT-yellow)](https://github.com/SPAICOM/semantic-alignment-via-sim/blob/main/LICENSE)
+
+ <br>
+
+</h5>
+
 > [!TIP]
 > Recent advances in AI call for a paradigm shift from bit-centric communication to goal- and semantics-oriented architectures, paving the way for AI-native 6G networks. In this context, we address a key open challenge: enabling heterogeneous AI agents to exchange compressed latent-space representations while mitigating semantic noise and preserving task-relevant meaning. We cast this challenge as learning both the communication topology and the alignment maps that govern information exchange among agents, yielding a learned network sheaf equipped with orthogonal maps. This learning process is further supported by a semantic denoising and compression module that constructs a shared global semantic space and derives sparse, structured representations of each agent’s latent space. This corresponds to a nonconvex dictionary learning problem solved iteratively with closed-form updates.
 Experiments with multiple AI agents pre-trained on real image data show that the semantic denoising and compression facilitates AI agents alignment and the extraction of semantic clusters, while preserving high accuracy in downstream task. The resulting communication network provides new insights about semantic heterogeneity across agents, highlighting the interpretability of our methodology.
